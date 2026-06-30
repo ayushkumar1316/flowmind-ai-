@@ -259,7 +259,7 @@ src
 
 ---
 
-# 📸 Screenshots
+<!-- # 📸 Screenshots
 
 - Login & Authentication
 - Personalized Onboarding
@@ -268,7 +268,7 @@ src
 - Task Board
 - AI Insights
 
-> *(Add screenshots here after deployment.)*
+> *(Add screenshots here after deployment.)* -->
 
 ---
 
