@@ -23,6 +23,42 @@ const getSmartMotivation = (taskText) => {
     return "Small progress today beats last-minute stress.";
 };
 
+const inferDuration = (taskText) => {
+    const text = (taskText || "").toLowerCase();
+    const hourMatch = text.match(/(\d+(?:\.\d+)?)\s*(hours?|hrs?|h)\b/);
+    if (hourMatch) return `${hourMatch[1]} ${Number(hourMatch[1]) === 1 ? "Hour" : "Hours"}`;
+
+    const minuteMatch = text.match(/(\d+)\s*(minutes?|mins?|m)\b/);
+    if (minuteMatch) return `${minuteMatch[1]} Min`;
+
+    if (text.match(/\b(water|drink)\b/)) return "5 Min";
+    if (text.match(/\b(meditate|mindfulness)\b/)) return "10 Min";
+    if (text.match(/\b(read|reading|book)\b/)) return "30 Min";
+    if (text.match(/\b(workout|gym|run|walk|exercise)\b/)) return "45 Min";
+    if (text.match(/\b(email|text|call|pay|buy|check)\b/)) return "15 Min";
+    if (text.match(/\b(project|dsa|study|code|build|write|assignment)\b/)) return "2 Hours";
+    return "30 Min";
+};
+
+const inferTargetCount = (taskText) => {
+    const text = (taskText || "").toLowerCase();
+    const explicitCount = text.match(/(\d+)\s*(times|glasses|pages|sets|rounds|chapters|problems|questions)\b/);
+    if (explicitCount) return Math.max(1, Number(explicitCount[1]));
+    if (text.match(/\b(water|drink)\b/)) return 8;
+    if (text.match(/\b(read|reading|book)\b/)) return 4;
+    return 1;
+};
+
+const getTaskTitle = (task) => typeof task === "string" ? task : task?.title || task?.task || "Untitled task";
+
+const findSourceTask = (taskText, parsedTasks) => {
+    const normalizedText = (taskText || "").toLowerCase();
+    return parsedTasks.find((item) => {
+        const sourceText = item.text.toLowerCase();
+        return normalizedText.includes(sourceText) || sourceText.includes(normalizedText);
+    });
+};
+
 function AIPlanner() {
     // =====================================
     // CORE SYSTEM STATES & REFS
@@ -107,8 +143,11 @@ function AIPlanner() {
             const lowerText = taskText.toLowerCase();
             let type = "Ambiguous";
             let timeframe = "Today";
-            let duration = "1 Hour";
+            let duration = inferDuration(taskText);
+            let targetCount = inferTargetCount(taskText);
+            let preferredTime = "Flexible";
             let confidence = "low";
+            let detailsComplete = false;
 
             if (/\b(water|gym|exercise|meditate|read|reading|run|walk|sleep|habit|routine|everyday|daily)\b/.test(lowerText)) {
                 type = "Daily Habit";
@@ -123,17 +162,20 @@ function AIPlanner() {
 
             if (/\b(tomorrow)\b/.test(lowerText)) timeframe = "Tomorrow";
             else if (/\b(next week|weekend)\b/.test(lowerText)) timeframe = "This Week";
+            if (/\b(morning)\b/.test(lowerText)) preferredTime = "Morning";
+            else if (/\b(afternoon)\b/.test(lowerText)) preferredTime = "Afternoon";
+            else if (/\b(evening|night)\b/.test(lowerText)) preferredTime = "Evening";
 
-            return { id: index + 1, text: taskText, type, timeframe, duration, confidence };
+            return { id: index + 1, text: taskText, type, timeframe, duration, targetCount, preferredTime, confidence, detailsComplete };
         });
 
         setParsedTasks(initializedTasks);
         setWizardActive(true);
         setIsReviewScreen(false);
 
-        const firstLowConfidenceIndex = initializedTasks.findIndex(t => t.confidence === "low");
-        if (firstLowConfidenceIndex !== -1) {
-            setCurrentTaskIndex(firstLowConfidenceIndex);
+        const firstNeedsDetailIndex = initializedTasks.findIndex(t => !t.detailsComplete);
+        if (firstNeedsDetailIndex !== -1) {
+            setCurrentTaskIndex(firstNeedsDetailIndex);
         } else {
             setIsReviewScreen(true);
             setCurrentTaskIndex(0);
@@ -141,7 +183,7 @@ function AIPlanner() {
     }, [prompt]);
 
     const advanceWizard = useCallback((currentSnapshot) => {
-        const nextIndex = currentSnapshot.findIndex((t, idx) => idx > currentTaskIndex && t.confidence === "low");
+        const nextIndex = currentSnapshot.findIndex((t, idx) => idx > currentTaskIndex && !t.detailsComplete);
         if (nextIndex !== -1) {
             setCurrentTaskIndex(nextIndex);
         } else {
@@ -149,27 +191,31 @@ function AIPlanner() {
         }
     }, [currentTaskIndex]);
 
-    const updateTaskProperty = useCallback((property, value) => {
+    const updateTaskProperty = useCallback((property, value, shouldAdvance = false) => {
         const updated = [...parsedTasks];
         updated[currentTaskIndex] = { ...updated[currentTaskIndex], [property]: value };
 
         if (property === "type") updated[currentTaskIndex].confidence = "high";
         setParsedTasks(updated);
 
-        const lowerText = updated[currentTaskIndex].text.toLowerCase();
-        if (property === "type" && value === "Daily Habit") {
-            advanceWizard(updated);
-        } else if (property === "timeframe" && (lowerText.includes("project") || lowerText.includes("dsa") || lowerText.includes("study"))) {
-            return;
-        } else if (property === "timeframe" || property === "duration") {
+        if (shouldAdvance) {
+            updated[currentTaskIndex] = { ...updated[currentTaskIndex], detailsComplete: true };
+            setParsedTasks(updated);
             advanceWizard(updated);
         }
+    }, [parsedTasks, currentTaskIndex, advanceWizard]);
+
+    const finishCurrentTaskDetails = useCallback(() => {
+        const updated = [...parsedTasks];
+        updated[currentTaskIndex] = { ...updated[currentTaskIndex], detailsComplete: true, confidence: "high" };
+        setParsedTasks(updated);
+        advanceWizard(updated);
     }, [parsedTasks, currentTaskIndex, advanceWizard]);
 
     const handlePrevious = useCallback(() => {
         if (isReviewScreen) {
             setIsReviewScreen(false);
-            const lastLow = parsedTasks.map((t, idx) => ({ t, idx })).reverse().find(obj => obj.t.confidence === "low" || obj.t.type === "Ambiguous");
+            const lastLow = parsedTasks.map((t, idx) => ({ t, idx })).reverse().find(obj => !obj.t.detailsComplete || obj.t.type === "Ambiguous");
             setCurrentTaskIndex(lastLow ? lastLow.idx : 0);
         } else if (currentTaskIndex > 0) {
             setCurrentTaskIndex(prev => prev - 1);
@@ -184,7 +230,7 @@ function AIPlanner() {
     const handleGenerateSmartPlan = useCallback(async () => {
         setLoading(true);
         const structuredContextPayload = parsedTasks.map(t =>
-            `- Task: "${t.text}" [Classification: ${t.type}, Horizon: ${t.timeframe}, Expected Effort: ${t.duration}]`
+            `- Task: "${t.text}" [Classification: ${t.type}, Horizon: ${t.timeframe}, Expected Effort: ${t.duration}, Habit Target: ${t.targetCount || 1}, Preferred Time: ${t.preferredTime || "Flexible"}]`
         ).join("\n");
 
         const structuralWrapperPrompt = `
@@ -211,6 +257,36 @@ Please establish a comprehensive execution schedule utilizing these specificatio
         }
     }, [parsedTasks, prompt]);
 
+    const buildTaskBoardTasks = useCallback((plan) => {
+        const sourceTasks = Array.isArray(plan?.todayPlan) && plan.todayPlan.length > 0
+            ? plan.todayPlan
+            : parsedTasks.map((task) => task.text);
+
+        return sourceTasks.map((task, index) => {
+            const title = getTaskTitle(task);
+            const source = findSourceTask(title, parsedTasks) || parsedTasks[index] || {};
+            const isHabit = source.type === "Daily Habit";
+            const deadlineDays = source.timeframe === "Tomorrow" ? 1 : source.timeframe === "This Week" ? 7 : 0;
+
+            return {
+                id: `task-${Date.now()}-${index}`,
+                title,
+                status: "To Do",
+                completed: false,
+                priority: isHabit ? "LOW" : "MEDIUM",
+                deadlineDays,
+                estimatedTime: source.duration || inferDuration(title),
+                timeBlock: source.preferredTime && source.preferredTime !== "Flexible" ? source.preferredTime : "Focus Block",
+                category: source.type || "One-time Milestone",
+                type: source.type || "One-time Milestone",
+                isRepeating: isHabit,
+                targetCount: isHabit ? Math.max(1, Number(source.targetCount || inferTargetCount(title))) : 1,
+                currentCount: 0,
+                createdAt: new Date().toISOString(),
+            };
+        });
+    }, [parsedTasks]);
+
     const handleCancelWorkspace = useCallback(() => {
         setResponse(null);
         setWizardActive(false);
@@ -221,7 +297,11 @@ Please establish a comprehensive execution schedule utilizing these specificatio
     const handleSyncToFlowMind = useCallback(async () => {
         setSyncState("syncing");
         try {
-            await savePlan(response);
+            await savePlan({
+                ...response,
+                taskBoardTasks: buildTaskBoardTasks(response),
+                plannerSourceTasks: parsedTasks,
+            });
             setSyncState("success");
             setTimeout(() => {
                 navigate("/");
@@ -232,7 +312,7 @@ Please establish a comprehensive execution schedule utilizing these specificatio
             setTimeout(() => setToastMessage(""), 3000);
             setSyncState("idle");
         }
-    }, [response, navigate]);
+    }, [response, navigate, buildTaskBoardTasks, parsedTasks]);
 
     const toggleVisualCheck = useCallback((index) => {
         setCheckedTasks(prev => prev.includes(index) ? prev.filter(i => i !== index) : [...prev, index]);
@@ -319,6 +399,7 @@ Please establish a comprehensive execution schedule utilizing these specificatio
                 ::-webkit-scrollbar-track { background: transparent; }
                 ::-webkit-scrollbar-thumb { background: #E9DFD3; border-radius: 10px; }
                 ::-webkit-scrollbar-thumb:hover { background: #D6C6FF; }
+                .planner-scroll-zone { scroll-padding-bottom: 120px; }
 
                 @keyframes shimmer {
                     0% { background-position: -200% 0; }
@@ -472,10 +553,12 @@ Please establish a comprehensive execution schedule utilizing these specificatio
                                             <p className="mb-1">Almost done.</p>
                                             {activeTask?.type === "Ambiguous" ? (
                                                 <p>Looks good. I just need one quick detail before I plan this. How should FlowMind track this work scope?</p>
+                                            ) : activeTask?.type === "Daily Habit" ? (
+                                                <p>FlowMind detected a habit. Set the target count and preferred time, or skip with the smart defaults.</p>
                                             ) : activeTask?.text.toLowerCase().includes("project") || activeTask?.text.toLowerCase().includes("dsa") || activeTask?.text.toLowerCase().includes("study") ? (
                                                 <p>Got it. For a technical milestone like this, what is your expected available window?</p>
                                             ) : (
-                                                <p>Perfect. When do you want to cross this milestone off your list?</p>
+                                                <p>Perfect. Confirm the deadline and effort, or keep the smart default.</p>
                                             )}
                                         </div>
                                     </div>
@@ -487,22 +570,94 @@ Please establish a comprehensive execution schedule utilizing these specificatio
                                                     <button key={opt} onClick={() => updateTaskProperty("type", opt)} className="px-4 py-2.5 bg-white border border-[#E9DFD3] rounded-full text-xs font-bold text-gray-700 hover:border-purple-300 hover:bg-purple-50/40 active:scale-95 transition focus:outline-none focus-visible:ring-2 focus-visible:ring-purple-500">🎯 {opt}</button>
                                                 ))}
                                             </div>
+                                        ) : activeTask?.type === "Daily Habit" ? (
+                                            <div className="space-y-4">
+                                                <div>
+                                                    <label className="text-[9px] font-black uppercase tracking-widest text-gray-400 block mb-2">Daily Target</label>
+                                                    <div className="flex flex-wrap gap-2">
+                                                        {[1, 2, 4, 8].map(count => (
+                                                            <button
+                                                                key={count}
+                                                                onClick={() => updateTaskProperty("targetCount", count)}
+                                                                className={`px-4 py-2 rounded-full text-xs font-bold transition border active:scale-95 focus:outline-none focus-visible:ring-2 focus-visible:ring-purple-500 ${
+                                                                    Number(activeTask.targetCount) === count ? "bg-purple-600 border-purple-600 text-white" : "bg-white border-[#E9DFD3] text-gray-700 hover:border-purple-200"
+                                                                }`}
+                                                            >
+                                                                {count}x
+                                                            </button>
+                                                        ))}
+                                                    </div>
+                                                </div>
+                                                <div>
+                                                    <label className="text-[9px] font-black uppercase tracking-widest text-gray-400 block mb-2">Preferred Time</label>
+                                                    <div className="flex flex-wrap gap-2">
+                                                        {["Flexible", "Morning", "Afternoon", "Evening"].map(time => (
+                                                            <button
+                                                                key={time}
+                                                                onClick={() => updateTaskProperty("preferredTime", time)}
+                                                                className={`px-4 py-2 rounded-full text-xs font-bold transition border active:scale-95 focus:outline-none focus-visible:ring-2 focus-visible:ring-purple-500 ${
+                                                                    activeTask.preferredTime === time ? "bg-purple-600 border-purple-600 text-white" : "bg-white border-[#E9DFD3] text-gray-700 hover:border-purple-200"
+                                                                }`}
+                                                            >
+                                                                {time}
+                                                            </button>
+                                                        ))}
+                                                    </div>
+                                                </div>
+                                                <div>
+                                                    <label className="text-[9px] font-black uppercase tracking-widest text-gray-400 block mb-2">Effort Per Check</label>
+                                                    <div className="flex flex-wrap gap-2">
+                                                        {["5 Min", "10 Min", "30 Min", "45 Min"].map(dur => (
+                                                            <button
+                                                                key={dur}
+                                                                onClick={() => updateTaskProperty("duration", dur)}
+                                                                className={`px-4 py-2 rounded-full text-xs font-bold transition border active:scale-95 focus:outline-none focus-visible:ring-2 focus-visible:ring-purple-500 ${
+                                                                    activeTask.duration === dur ? "bg-purple-600 border-purple-600 text-white" : "bg-white border-[#E9DFD3] text-gray-700 hover:border-purple-200"
+                                                                }`}
+                                                            >
+                                                                ⏱ {dur}
+                                                            </button>
+                                                        ))}
+                                                    </div>
+                                                </div>
+                                                <button
+                                                    onClick={finishCurrentTaskDetails}
+                                                    className="w-full sm:w-auto px-6 py-3 bg-purple-600 hover:bg-purple-700 text-white font-bold text-xs rounded-xl shadow-[0_6px_20px_rgba(126,34,206,0.2)] transition uppercase tracking-wider active:scale-95 focus:outline-none focus-visible:ring-2 focus-visible:ring-offset-2 focus-visible:ring-purple-500"
+                                                >
+                                                    Continue
+                                                </button>
+                                            </div>
                                         ) : activeTask?.text.toLowerCase().includes("project") || activeTask?.text.toLowerCase().includes("dsa") || activeTask?.text.toLowerCase().includes("study") ? (
                                             <div className="space-y-4">
                                                 <div>
                                                     <label className="text-[9px] font-black uppercase tracking-widest text-gray-400 block mb-2">Available Hours</label>
                                                     <div className="flex flex-wrap gap-2">
                                                         {["1 Hour", "2 Hours", "3+ Hours"].map(dur => (
-                                                            <button key={dur} onClick={() => updateTaskProperty("duration", dur)} className="px-4 py-2 rounded-full text-xs font-bold transition bg-white border border-[#E9DFD3] text-gray-700 hover:border-purple-200 active:scale-95 focus:outline-none focus-visible:ring-2 focus-visible:ring-purple-500">⏱ {dur}</button>
+                                                            <button key={dur} onClick={() => updateTaskProperty("duration", dur)} className={`px-4 py-2 rounded-full text-xs font-bold transition border active:scale-95 focus:outline-none focus-visible:ring-2 focus-visible:ring-purple-500 ${activeTask.duration === dur ? "bg-purple-600 border-purple-600 text-white" : "bg-white border-[#E9DFD3] text-gray-700 hover:border-purple-200"}`}>⏱ {dur}</button>
                                                         ))}
                                                     </div>
                                                 </div>
+                                                <button onClick={finishCurrentTaskDetails} className="px-6 py-3 bg-purple-600 hover:bg-purple-700 text-white font-bold text-xs rounded-xl shadow-[0_6px_20px_rgba(126,34,206,0.2)] transition uppercase tracking-wider active:scale-95 focus:outline-none focus-visible:ring-2 focus-visible:ring-offset-2 focus-visible:ring-purple-500">Continue</button>
                                             </div>
                                         ) : (
-                                            <div className="flex flex-wrap gap-2">
-                                                {["Today", "Tomorrow", "This Week"].map(time => (
-                                                    <button key={time} onClick={() => updateTaskProperty("timeframe", time)} className="px-4 py-2.5 rounded-full text-xs font-bold transition bg-white border border-[#E9DFD3] text-gray-700 hover:border-purple-200 active:scale-95 focus:outline-none focus-visible:ring-2 focus-visible:ring-purple-500">📅 {time}</button>
-                                                ))}
+                                            <div className="space-y-4">
+                                                <div>
+                                                    <label className="text-[9px] font-black uppercase tracking-widest text-gray-400 block mb-2">Deadline</label>
+                                                    <div className="flex flex-wrap gap-2">
+                                                        {["Today", "Tomorrow", "This Week"].map(time => (
+                                                            <button key={time} onClick={() => updateTaskProperty("timeframe", time)} className={`px-4 py-2.5 rounded-full text-xs font-bold transition border active:scale-95 focus:outline-none focus-visible:ring-2 focus-visible:ring-purple-500 ${activeTask.timeframe === time ? "bg-purple-600 border-purple-600 text-white" : "bg-white border-[#E9DFD3] text-gray-700 hover:border-purple-200"}`}>📅 {time}</button>
+                                                        ))}
+                                                    </div>
+                                                </div>
+                                                <div>
+                                                    <label className="text-[9px] font-black uppercase tracking-widest text-gray-400 block mb-2">Estimated Time</label>
+                                                    <div className="flex flex-wrap gap-2">
+                                                        {["15 Min", "30 Min", "1 Hour", "2 Hours"].map(dur => (
+                                                            <button key={dur} onClick={() => updateTaskProperty("duration", dur)} className={`px-4 py-2 rounded-full text-xs font-bold transition border active:scale-95 focus:outline-none focus-visible:ring-2 focus-visible:ring-purple-500 ${activeTask.duration === dur ? "bg-purple-600 border-purple-600 text-white" : "bg-white border-[#E9DFD3] text-gray-700 hover:border-purple-200"}`}>⏱ {dur}</button>
+                                                        ))}
+                                                    </div>
+                                                </div>
+                                                <button onClick={finishCurrentTaskDetails} className="px-6 py-3 bg-purple-600 hover:bg-purple-700 text-white font-bold text-xs rounded-xl shadow-[0_6px_20px_rgba(126,34,206,0.2)] transition uppercase tracking-wider active:scale-95 focus:outline-none focus-visible:ring-2 focus-visible:ring-offset-2 focus-visible:ring-purple-500">Continue</button>
                                             </div>
                                         )}
                                     </div>
@@ -532,10 +687,12 @@ Please establish a comprehensive execution schedule utilizing these specificatio
                                                     </div>
                                                     <div className="flex flex-wrap items-center gap-1.5">
                                                         <span className="px-2 py-0.5 bg-purple-50 text-purple-700 rounded text-[9px] font-bold">{task.type}</span>
-                                                        {task.type !== "Daily Habit" && (
+                                                        <span className="px-2 py-0.5 bg-gray-50 text-gray-500 rounded text-[9px] font-bold">{task.timeframe}</span>
+                                                        <span className="px-2 py-0.5 bg-gray-50 text-gray-500 rounded text-[9px] font-bold">{task.duration}</span>
+                                                        {task.type === "Daily Habit" && (
                                                             <>
-                                                                <span className="px-2 py-0.5 bg-gray-50 text-gray-500 rounded text-[9px] font-bold">{task.timeframe}</span>
-                                                                <span className="px-2 py-0.5 bg-gray-50 text-gray-500 rounded text-[9px] font-bold">{task.duration}</span>
+                                                                <span className="px-2 py-0.5 bg-green-50 text-green-700 rounded text-[9px] font-bold border border-green-100">{task.targetCount || 1}x target</span>
+                                                                <span className="px-2 py-0.5 bg-amber-50 text-amber-700 rounded text-[9px] font-bold border border-amber-100">{task.preferredTime || "Flexible"}</span>
                                                             </>
                                                         )}
                                                     </div>
@@ -603,7 +760,7 @@ Please establish a comprehensive execution schedule utilizing these specificatio
                             VIEW STATE 4: MINIMAL EXECUTION WORKSPACE
                         ===================================== */}
                         {response && !loading && (
-                            <div className="w-full flex flex-col gap-4 relative pb-8">
+                            <div className="w-full flex flex-col gap-4 relative pb-28 planner-scroll-zone">
 
                                 {/* TOP ROW: Success Chance + AI Coach */}
                                 <div className="grid grid-cols-1 md:grid-cols-3 gap-4 stagger-1">
@@ -647,10 +804,11 @@ Please establish a comprehensive execution schedule utilizing these specificatio
                                     {response.todayPlan?.length > 0 ? (
                                         <div className="space-y-3">
                                             {response.todayPlan.map((task, index) => {
-                                                const taskText = typeof task === 'string' ? task : task.title;
+                                                const taskText = getTaskTitle(task);
                                                 const isChecked = checkedTasks.includes(index);
-                                                const matchedTask = parsedTasks.find(pt => taskText.toLowerCase().includes(pt.text.toLowerCase()) || pt.text.toLowerCase().includes(taskText.toLowerCase()));
+                                                const matchedTask = findSourceTask(taskText, parsedTasks);
                                                 const duration = matchedTask ? matchedTask.duration : "Focus Block";
+                                                const isHabit = matchedTask?.type === "Daily Habit";
 
                                                 return (
                                                     <div key={index} className={`p-4 rounded-xl border transition-all duration-300 ease-out flex items-start gap-4 ${isChecked ? 'bg-green-50/30 border-green-200/50 opacity-75 scale-[0.99] shadow-[0_0_15px_rgba(34,197,94,0.06)]' : 'bg-white border-[#EFE5D9] hover:border-purple-200 hover:shadow-md hover:-translate-y-0.5'}`}>
@@ -664,7 +822,14 @@ Please establish a comprehensive execution schedule utilizing these specificatio
                                                         <div className="flex-1 min-w-0 transition-opacity duration-300">
                                                             <div className="flex flex-col sm:flex-row sm:items-center justify-between gap-2 mb-1">
                                                                 <h4 className={`text-sm font-black transition-colors duration-300 truncate ${isChecked ? 'text-gray-400 line-through' : 'text-gray-900'}`} title={taskText}>{taskText}</h4>
-                                                                <span className="inline-flex items-center px-2 py-0.5 rounded text-[10px] font-bold bg-[#FAF8F4] text-gray-500 border border-[#E9DFD3] shrink-0">⏱ {duration}</span>
+                                                                <div className="flex flex-wrap items-center gap-1.5 shrink-0">
+                                                                    {isHabit && (
+                                                                        <span className="inline-flex items-center px-2 py-0.5 rounded text-[10px] font-bold bg-green-50 text-green-700 border border-green-100">
+                                                                            Habit {matchedTask.targetCount || 1}x
+                                                                        </span>
+                                                                    )}
+                                                                    <span className="inline-flex items-center px-2 py-0.5 rounded text-[10px] font-bold bg-[#FAF8F4] text-gray-500 border border-[#E9DFD3]">⏱ {duration}</span>
+                                                                </div>
                                                             </div>
                                                             <p className={`text-xs font-semibold italic transition-colors duration-300 ${isChecked ? 'text-gray-300' : 'text-gray-400'}`}>"{getSmartMotivation(taskText)}"</p>
                                                         </div>
@@ -688,7 +853,7 @@ Please establish a comprehensive execution schedule utilizing these specificatio
                                         <div className="relative pl-2.5 space-y-4">
                                             <div className="absolute top-2 bottom-2 left-[13.5px] w-px bg-gray-100"></div>
                                             {response.upcomingTasks.map((task, index) => {
-                                                const taskText = typeof task === "string" ? task : task.title;
+                                                const taskText = getTaskTitle(task);
                                                 const priority = typeof task !== "string" && task.priority ? task.priority : "Upcoming";
                                                 const est = typeof task !== "string" && task.estimatedTime ? task.estimatedTime : "Planned";
 

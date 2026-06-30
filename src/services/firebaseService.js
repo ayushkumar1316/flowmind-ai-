@@ -27,6 +27,27 @@ const getOrCreateSessionId = () => {
     return sessionId;
 };
 
+const cleanForFirestore = (value) => {
+    if (Array.isArray(value)) {
+        return value
+            .map((item) => cleanForFirestore(item))
+            .filter((item) => item !== undefined);
+    }
+
+    if (value && typeof value === "object") {
+        const cleaned = {};
+        Object.entries(value).forEach(([key, item]) => {
+            const cleanedValue = cleanForFirestore(item);
+            if (cleanedValue !== undefined) {
+                cleaned[key] = cleanedValue;
+            }
+        });
+        return cleaned;
+    }
+
+    return value === undefined ? undefined : value;
+};
+
 export const savePlan = async (planData) => {
     if (!planData || !isInitialized || !db) return false;
 
@@ -36,13 +57,7 @@ export const savePlan = async (planData) => {
     try {
         const planRef = doc(db, "plans", sessionId);
         
-        // Clean undefined values
-        const cleanedPlanData = {};
-        Object.keys(planData).forEach(key => {
-            if (planData[key] !== null && planData[key] !== undefined) {
-                cleanedPlanData[key] = planData[key];
-            }
-        });
+        const cleanedPlanData = cleanForFirestore(planData);
 
         const mergedPlan = {
             ...cleanedPlanData,

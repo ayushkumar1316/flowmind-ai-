@@ -2,6 +2,7 @@ import { memo, useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { useNavigate } from "react-router-dom";
 import { savePlan, subscribeToPlan } from "../services/firebaseService";
 import { Brain, CalendarDays } from "lucide-react";
+import { useAuth } from "../contexts/AuthContext";
 
 const priorityWeights = { HIGH: 3, MEDIUM: 2, LOW: 1 };
 
@@ -83,6 +84,7 @@ function Dashboard() {
     const toastTimeoutRef = useRef(null);
 
     const navigate = useNavigate();
+    const { profile } = useAuth();
 
     useEffect(() => {
         const updateClock = () => {
@@ -181,7 +183,7 @@ function Dashboard() {
     const completedTaskCount = completedTasks.length;
     const totalTaskCount = tasks.length;
     const progressPercentage = totalTaskCount === 0 ? 0 : Math.round((completedTaskCount / totalTaskCount) * 100);
-    const currentStreak = Number(plan?.currentStreak ?? plan?.productivityStreak ?? plan?.streak?.current ?? 0);
+    const currentStreak = Number(profile?.stats?.currentStreak ?? plan?.currentStreak ?? plan?.productivityStreak ?? plan?.streak?.current ?? 0);
     const aiCoachMessage = plan?.aiCoachMessage || plan?.agentMessage || plan?.confidenceMessage || "";
     const syncedAtMs = useMemo(() => {
         const rawDate = plan?.updatedAt || plan?.savedAt || plan?.activatedAt;

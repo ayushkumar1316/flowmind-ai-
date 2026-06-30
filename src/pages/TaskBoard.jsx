@@ -1,6 +1,7 @@
 // src/pages/TaskBoard.jsx
 import { useState, useMemo, useEffect, useCallback, useRef } from "react";
 import { subscribeToPlan, savePlan } from "../services/firebaseService";
+import { useAuth } from "../contexts/AuthContext";
 
 // Helper: Convert "4 Hours" or "30 Min" into a comparable numeric hour value
 const parseDuration = (timeStr) => {
@@ -10,6 +11,22 @@ const parseDuration = (timeStr) => {
     if (lower.includes('min')) return val / 60;
     return val;
 };
+
+const getFocusSeconds = (timeStr) => {
+    const hours = parseDuration(timeStr);
+    return Math.max(60, Math.round(hours * 60 * 60));
+};
+
+const formatTimer = (seconds) => {
+    const safeSeconds = Math.max(0, seconds || 0);
+    const hrs = Math.floor(safeSeconds / 3600);
+    const mins = Math.floor((safeSeconds % 3600) / 60);
+    const secs = safeSeconds % 60;
+    const pad = (value) => String(value).padStart(2, "0");
+    return hrs > 0 ? `${pad(hrs)}:${pad(mins)}:${pad(secs)}` : `${pad(mins)}:${pad(secs)}`;
+};
+
+const getTodayKey = () => new Date().toLocaleDateString("en-CA");
 
 // Priority Weights for Smart Sorting
 const priorityWeights = { HIGH: 3, MEDIUM: 2, LOW: 1 };
@@ -44,6 +61,11 @@ const augmentTaskRepeating = (task) => {
 const normalizeTask = (task, index) => {
     const source = typeof task === "string" ? { title: task } : (task || {});
     const deadlineValue = source.deadlineDays ?? source.daysRemaining;
+    const todayKey = getTodayKey();
+    const isRepeating = Boolean(source.isRepeating);
+    const lastProgressDate = source.lastProgressDate || source.completedDate;
+    const shouldResetHabit = isRepeating && lastProgressDate && lastProgressDate !== todayKey;
+    const status = shouldResetHabit ? "To Do" : (source.status || (source.completed ? "Completed" : "To Do"));
 
     return augmentTaskRepeating({
         ...source,
@@ -54,7 +76,10 @@ const normalizeTask = (task, index) => {
         estimatedTime: source.estimatedTime || source.duration || source.timeEstimate || "1 Hour",
         timeBlock: source.timeBlock || "Focus Block",
         category: source.category || "FlowMind Plan",
-        status: source.status || (source.completed ? "Completed" : "To Do"),
+        status,
+        completed: shouldResetHabit ? false : source.completed,
+        currentCount: shouldResetHabit ? 0 : source.currentCount,
+        lastProgressDate: shouldResetHabit ? todayKey : source.lastProgressDate,
     });
 };
 
@@ -82,12 +107,14 @@ function TaskBoard() {
     const [activeNoteContent, setActiveNoteContent] = useState("");
     const [notesSaved, setNotesSaved] = useState(false);
     const [completingId, setCompletingId] = useState(null);
+    const [focusTimer, setFocusTimer] = useState(null);
     
     // Toast & Celebration States
     const [celebration, setCelebration] = useState(null);
     const [deletedTaskInfo, setDeletedTaskInfo] = useState(null);
     const deleteTimeoutRef = useRef(null);
     const latestPlanRef = useRef(null);
+    const { profile } = useAuth();
 
     // =====================================
     // REALTIME FIREBASE SUBSCRIPTION
@@ -105,6 +132,25 @@ function TaskBoard() {
             if (deleteTimeoutRef.current) clearTimeout(deleteTimeoutRef.current);
         };
     }, []);
+
+    useEffect(() => {
+        if (!focusTimer?.isRunning || focusTimer.remainingSeconds <= 0) return undefined;
+
+        const intervalId = setInterval(() => {
+            setFocusTimer((timer) => {
+                if (!timer?.isRunning) return timer;
+                const nextRemaining = Math.max(0, timer.remainingSeconds - 1);
+                return {
+                    ...timer,
+                    remainingSeconds: nextRemaining,
+                    isRunning: nextRemaining > 0,
+                    expired: nextRemaining === 0,
+                };
+            });
+        }, 1000);
+
+        return () => clearInterval(intervalId);
+    }, [focusTimer?.isRunning, focusTimer?.remainingSeconds]);
 
     // =====================================
     // GLOBAL SYNC ENGINE
@@ -146,7 +192,15 @@ function TaskBoard() {
             setTasks(prev => {
                 const updated = prev.map(t => {
                     if (t.id === taskId) {
-                        return { ...t, status: "Completed", currentCount: t.targetCount || t.currentCount };
+                        return {
+                            ...t,
+                            status: "Completed",
+                            completed: true,
+                            completedAt: new Date().toISOString(),
+                            completedDate: getTodayKey(),
+                            lastProgressDate: getTodayKey(),
+                            currentCount: t.targetCount || t.currentCount,
+                        };
                     }
                     return t;
                 });
@@ -158,8 +212,27 @@ function TaskBoard() {
             if (focusedTaskId === taskId) {
                 setFocusedTaskId(null);
             }
+            setFocusTimer((timer) => timer?.taskId === taskId ? null : timer);
         }, 400);
     }, [focusedTaskId, syncPlanUpdates, triggerCelebration]);
+
+    const handleUndoComplete = useCallback((taskId) => {
+        setTasks(prev => {
+            const updated = prev.map(t => {
+                if (t.id !== taskId) return t;
+                return {
+                    ...t,
+                    status: "To Do",
+                    completed: false,
+                    completedAt: undefined,
+                    completedDate: undefined,
+                    currentCount: t.isRepeating ? 0 : t.currentCount,
+                };
+            });
+            syncPlanUpdates(updated);
+            return updated;
+        });
+    }, [syncPlanUpdates]);
 
     const handleIncrementRepeating = useCallback((taskId) => {
         setTasks(prev => {
@@ -170,7 +243,7 @@ function TaskBoard() {
                     if (nextCount >= t.targetCount) {
                         shouldComplete = true;
                     }
-                    return { ...t, currentCount: nextCount };
+                    return { ...t, currentCount: nextCount, lastProgressDate: getTodayKey() };
                 }
                 return t;
             });
@@ -220,6 +293,7 @@ function TaskBoard() {
     const handleToggleFocus = useCallback((task) => {
         if (focusedTaskId === task.id) {
             setFocusedTaskId(null);
+            setFocusTimer((timer) => timer?.taskId === task.id ? null : timer);
             const updated = tasks.map(t => t.id === task.id ? { ...t, notes: activeNoteContent } : t);
             setTasks(updated);
             syncPlanUpdates(updated);
@@ -232,8 +306,30 @@ function TaskBoard() {
             setFocusedTaskId(task.id);
             setActiveNoteContent(task.notes || "");
             setNotesSaved(false);
+            const totalSeconds = getFocusSeconds(task.estimatedTime);
+            setFocusTimer({
+                taskId: task.id,
+                totalSeconds,
+                remainingSeconds: totalSeconds,
+                isRunning: true,
+                expired: false,
+            });
         }
     }, [focusedTaskId, tasks, activeNoteContent, syncPlanUpdates]);
+
+    const handleAddFocusTime = useCallback((minutes) => {
+        setFocusTimer((timer) => {
+            if (!timer) return timer;
+            const addedSeconds = minutes * 60;
+            return {
+                ...timer,
+                totalSeconds: timer.totalSeconds + addedSeconds,
+                remainingSeconds: timer.remainingSeconds + addedSeconds,
+                isRunning: true,
+                expired: false,
+            };
+        });
+    }, []);
 
     const handleNotesChange = (e) => setActiveNoteContent(e.target.value);
 
@@ -277,6 +373,7 @@ function TaskBoard() {
     const completedCount = completedTasksList.length;
     const progressPercent = totalTasksCount === 0 ? 0 : Math.round((completedCount / totalTasksCount) * 100);
     const isOnlyRepeatingLeft = activeTasks.length > 0 && activeTasks.every(t => t.isRepeating);
+    const currentStreak = Number(profile?.stats?.currentStreak ?? latestPlanRef.current?.currentStreak ?? latestPlanRef.current?.productivityStreak ?? latestPlanRef.current?.streak?.current ?? 0);
 
     // Styling Helpers
     const getPriorityStyles = useCallback((priority) => {
@@ -326,6 +423,17 @@ function TaskBoard() {
                     100% { opacity: 1; transform: translateY(0); }
                 }
                 .animate-fade-in-up { animation: slideUpFade 0.3s cubic-bezier(0.16, 1, 0.3, 1) forwards; }
+                @keyframes hourglassTurn {
+                    0%, 22% { transform: rotate(0deg) scale(1); }
+                    30%, 70% { transform: rotate(180deg) scale(1.06); }
+                    78%, 100% { transform: rotate(360deg) scale(1); }
+                }
+                @keyframes timerGlow {
+                    0%, 100% { box-shadow: 0 18px 45px rgba(147, 51, 234, 0.16); }
+                    50% { box-shadow: 0 18px 58px rgba(34, 197, 94, 0.18); }
+                }
+                .focus-hourglass { animation: hourglassTurn 2.4s ease-in-out infinite; transform-origin: center; }
+                .focus-timer-card { animation: timerGlow 2.8s ease-in-out infinite; }
             `}</style>
             
             <div className="relative min-h-screen bg-transparent text-gray-800 font-sans pb-16">
@@ -407,7 +515,7 @@ function TaskBoard() {
                         <div className="bg-white rounded-2xl border border-[#E9DFD3]/80 p-4 shadow-[0_4px_20px_rgba(80,62,38,0.03)] flex flex-col justify-center">
                             <span className="text-[10px] font-black uppercase tracking-widest text-gray-400 mb-1">Current Streak</span>
                             <div className="flex items-center gap-2">
-                                <span className="text-2xl font-black text-purple-600">12</span>
+                                <span className="text-2xl font-black text-purple-600">{currentStreak}</span>
                                 <span className="text-lg">🔥</span>
                             </div>
                         </div>
@@ -450,6 +558,10 @@ function TaskBoard() {
                                     {activeTasks.map((task) => {
                                         const isFocused = focusedTaskId === task.id;
                                         const isCompleting = completingId === task.id;
+                                        const activeTimer = isFocused && focusTimer?.taskId === task.id ? focusTimer : null;
+                                        const timerProgress = activeTimer?.totalSeconds
+                                            ? Math.max(0, Math.min(100, ((activeTimer.totalSeconds - activeTimer.remainingSeconds) / activeTimer.totalSeconds) * 100))
+                                            : 0;
                                         
                                         return (
                                             <div 
@@ -553,13 +665,74 @@ function TaskBoard() {
                                                     <div className="mt-3 pt-5 border-t border-[#E9DFD3]/80 animate-fade-in-up flex flex-col gap-6">
                                                         
                                                         {/* Top Workspace Meta */}
-                                                        <div className="flex flex-col gap-1.5 px-1">
-                                                            <span className="text-[10px] font-black uppercase tracking-widest text-purple-600">Currently Working</span>
-                                                            <h3 className="text-xl font-black text-gray-900 leading-tight">{task.title}</h3>
-                                                            <div className="flex flex-wrap items-center gap-2 mt-2">
-                                                                <span className="text-[11px] font-semibold text-gray-600 bg-gray-50 px-2.5 py-1 rounded border border-gray-100 shadow-3xs flex items-center gap-1.5"><span className="text-gray-400">⏱</span> {task.estimatedTime || "1 Hour"}</span>
-                                                                <span className="text-[11px] font-semibold text-gray-600 bg-gray-50 px-2.5 py-1 rounded border border-gray-100 shadow-3xs flex items-center gap-1.5"><span className="text-gray-400">📅</span> Due in {task.deadlineDays || 1}d</span>
+                                                        <div className="flex flex-col xl:flex-row xl:items-start justify-between gap-5 px-1">
+                                                            <div className="flex flex-col gap-1.5 min-w-0 flex-1">
+                                                                <span className="text-[10px] font-black uppercase tracking-widest text-purple-600">Currently Working</span>
+                                                                <h3 className="text-xl font-black text-gray-900 leading-tight">{task.title}</h3>
+                                                                <div className="flex flex-wrap items-center gap-2 mt-2">
+                                                                    <span className="text-[11px] font-semibold text-gray-600 bg-gray-50 px-2.5 py-1 rounded border border-gray-100 shadow-3xs flex items-center gap-1.5"><span className="text-gray-400">⏱</span> {task.estimatedTime || "1 Hour"}</span>
+                                                                    <span className="text-[11px] font-semibold text-gray-600 bg-gray-50 px-2.5 py-1 rounded border border-gray-100 shadow-3xs flex items-center gap-1.5"><span className="text-gray-400">📅</span> Due in {task.deadlineDays || 1}d</span>
+                                                                </div>
                                                             </div>
+
+                                                            {activeTimer && (
+                                                                <div className={`focus-timer-card w-full xl:w-[300px] shrink-0 rounded-2xl border p-4 transition-all ${
+                                                                    activeTimer.expired
+                                                                        ? "bg-red-50 border-red-100"
+                                                                        : "bg-white border-purple-100"
+                                                                }`}>
+                                                                    <div className="flex items-center gap-4">
+                                                                        <div
+                                                                            className="relative w-16 h-16 rounded-2xl flex items-center justify-center shrink-0"
+                                                                            style={{
+                                                                                background: `conic-gradient(#9333ea ${timerProgress}%, #f1e8ff ${timerProgress}% 100%)`,
+                                                                            }}
+                                                                        >
+                                                                            <div className="absolute inset-1.5 rounded-[14px] bg-white"></div>
+                                                                            <span className="focus-hourglass relative text-2xl" aria-hidden="true">⏳</span>
+                                                                        </div>
+                                                                        <div className="min-w-0 flex-1">
+                                                                            <p className="text-[10px] font-black uppercase tracking-[0.16em] text-gray-400">
+                                                                                {activeTimer.expired ? "Time Finished" : "Focus Timer"}
+                                                                            </p>
+                                                                            <p className={`mt-0.5 text-3xl font-black tabular-nums tracking-tight ${
+                                                                                activeTimer.expired ? "text-red-600" : "text-gray-950"
+                                                                            }`}>
+                                                                                {formatTimer(activeTimer.remainingSeconds)}
+                                                                            </p>
+                                                                            <p className="text-[11px] font-bold text-gray-400">
+                                                                                {activeTimer.expired ? "Need more time?" : "Running from assigned task time"}
+                                                                            </p>
+                                                                        </div>
+                                                                    </div>
+
+                                                                    {activeTimer.expired && (
+                                                                        <div className="mt-4 grid grid-cols-3 gap-2">
+                                                                            <button
+                                                                                type="button"
+                                                                                onClick={() => handleCompleteWithAnimation(task.id)}
+                                                                                className="rounded-xl bg-green-500 px-3 py-2 text-[10px] font-black uppercase tracking-wider text-white shadow-sm hover:bg-green-600 active:scale-95 transition-all focus:outline-none focus-visible:ring-2 focus-visible:ring-green-400"
+                                                                            >
+                                                                                Complete
+                                                                            </button>
+                                                                            <button
+                                                                                type="button"
+                                                                                onClick={() => handleAddFocusTime(10)}
+                                                                                className="rounded-xl bg-white px-3 py-2 text-[10px] font-black uppercase tracking-wider text-purple-700 border border-purple-100 hover:bg-purple-50 active:scale-95 transition-all focus:outline-none focus-visible:ring-2 focus-visible:ring-purple-400"
+                                                                            >
+                                                                                +10m
+                                                                            </button>
+                                                                            <button
+                                                                                type="button"
+                                                                                onClick={() => handleAddFocusTime(15)}
+                                                                                className="rounded-xl bg-white px-3 py-2 text-[10px] font-black uppercase tracking-wider text-purple-700 border border-purple-100 hover:bg-purple-50 active:scale-95 transition-all focus:outline-none focus-visible:ring-2 focus-visible:ring-purple-400"
+                                                                            >
+                                                                                +15m
+                                                                            </button>
+                                                                        </div>
+                                                                    )}
+                                                        </div>
+                                                            )}
                                                         </div>
 
                                                         {/* Smart Motivation */}
@@ -657,7 +830,13 @@ function TaskBoard() {
                                         {completedTasksList.length > 0 ? completedTasksList.map((task, idx) => (
                                             <div key={idx} className="flex items-center justify-between gap-3 p-2 rounded-lg bg-white border border-gray-100 shadow-3xs group transition-all">
                                                 <h4 className="text-[11px] font-bold text-gray-400 line-through truncate flex-1">{task.title}</h4>
-                                                <span className="text-[9px] font-black uppercase text-gray-300 tracking-wider shrink-0">Done</span>
+                                                <button
+                                                    type="button"
+                                                    onClick={() => handleUndoComplete(task.id)}
+                                                    className="text-[9px] font-black uppercase text-purple-600 bg-purple-50 hover:bg-purple-100 border border-purple-100 tracking-wider shrink-0 rounded-md px-2 py-1 transition-colors focus:outline-none focus-visible:ring-2 focus-visible:ring-purple-400"
+                                                >
+                                                    Undo
+                                                </button>
                                             </div>
                                         )) : (
                                             <p className="text-[11px] font-medium text-gray-400 px-2 py-1 italic">No tasks completed yet.</p>
