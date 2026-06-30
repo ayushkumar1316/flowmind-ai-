@@ -1,521 +1,677 @@
-import { useState, useMemo, useEffect } from "react";
-import { useLocation } from "react-router-dom";
-import MainLayout from "../components/layout/MainLayout";
+// src/pages/TaskBoard.jsx
+import { useState, useMemo, useEffect, useCallback, useRef } from "react";
+import { subscribeToPlan, savePlan } from "../services/firebaseService";
+
+// Helper: Convert "4 Hours" or "30 Min" into a comparable numeric hour value
+const parseDuration = (timeStr) => {
+    if (!timeStr) return 0;
+    const lower = timeStr.toLowerCase();
+    let val = parseFloat(timeStr) || 0;
+    if (lower.includes('min')) return val / 60;
+    return val;
+};
+
+// Priority Weights for Smart Sorting
+const priorityWeights = { HIGH: 3, MEDIUM: 2, LOW: 1 };
+
+// Premium Smart Motivation Engine
+const getSmartMotivation = (taskText) => {
+    const text = (taskText || "").toLowerCase();
+    if (text.match(/study|dsa|read|learn|book|course|academic/)) return "One focused session beats hours of distraction.";
+    if (text.match(/workout|gym|run|walk|water|health|exercise/)) return "Your future self will thank you.";
+    if (text.match(/call|email|apply|resume|internship|placement|job/)) return "Small applications create big opportunities.";
+    if (text.match(/code|project|frontend|backend|build|design/)) return "One block at a time. Small pushes ship products.";
+    return "Small progress today beats last-minute stress.";
+};
+
+// Heuristic to detect and augment repeating tasks if missing
+const augmentTaskRepeating = (task) => {
+    if (task.isRepeating !== undefined) return task;
+    const text = task.title.toLowerCase();
+    let isRepeating = false;
+    let targetCount = 1;
+    
+    if (text.includes("water")) { isRepeating = true; targetCount = 8; }
+    else if (/\b(gym|workout|exercise|meditate|meditation|read|walk|run|habit)\b/.test(text)) { isRepeating = true; targetCount = 1; }
+    else if (task.type === "Daily Habit") { isRepeating = true; targetCount = 1; }
+
+    if (isRepeating) {
+        return { ...task, isRepeating, targetCount, currentCount: task.currentCount || 0 };
+    }
+    return task;
+};
+
+const normalizeTask = (task, index) => {
+    const source = typeof task === "string" ? { title: task } : (task || {});
+    const deadlineValue = source.deadlineDays ?? source.daysRemaining;
+
+    return augmentTaskRepeating({
+        ...source,
+        id: source.id ?? `today-${index}`,
+        title: source.title || source.task || "Untitled task",
+        priority: source.priority || "MEDIUM",
+        deadlineDays: Number.isFinite(Number(deadlineValue)) ? Number(deadlineValue) : 1,
+        estimatedTime: source.estimatedTime || source.duration || source.timeEstimate || "1 Hour",
+        timeBlock: source.timeBlock || "Focus Block",
+        category: source.category || "FlowMind Plan",
+        status: source.status || (source.completed ? "Completed" : "To Do"),
+    });
+};
+
+const getPlanTasks = (plan) => {
+    if (Array.isArray(plan?.taskBoardTasks)) return plan.taskBoardTasks.map(normalizeTask);
+    if (Array.isArray(plan?.todayPlan)) return plan.todayPlan.map(normalizeTask);
+    if (Array.isArray(plan?.strictlyDoToday)) return plan.strictlyDoToday.map(normalizeTask);
+    return [];
+};
 
 function TaskBoard() {
     // =====================================
-    // FLOWMIND AI TASK BOARD
-    // Status: TASK BOARD = FINAL SYNC LOCKED 🔒
-    // Integration: Save My Day + Dashboard Sync + Interactive Subtasks
+    // FLOWMIND AI EXECUTION WORKSPACE
+    // Status: ✅ PASS 4 - PRODUCTION LOCKED 🔒
     // =====================================
 
-    // Core Functional States
-    const [nlInput, setNlInput] = useState("");
-    const [aiState, setAiState] = useState(null); // null | "recalculating" | "success"
-    const [filter, setFilter] = useState("All");
+    // Core States
+    const [tasks, setTasks] = useState([]);
+    const [isLoading, setIsLoading] = useState(true);
+    const [error, setError] = useState(null);
+    
+    // UI Interaction States
+    const [completedExpanded, setCompletedExpanded] = useState(false);
+    const [focusedTaskId, setFocusedTaskId] = useState(null);
+    const [activeNoteContent, setActiveNoteContent] = useState("");
+    const [notesSaved, setNotesSaved] = useState(false);
+    const [completingId, setCompletingId] = useState(null);
+    
+    // Toast & Celebration States
+    const [celebration, setCelebration] = useState(null);
+    const [deletedTaskInfo, setDeletedTaskInfo] = useState(null);
+    const deleteTimeoutRef = useRef(null);
+    const latestPlanRef = useRef(null);
 
-    // NEW: Save My Day Highlights
-    const [todayPlanTasks, setTodayPlanTasks] = useState([]);
-
-    // Hydrate "Today's Plan" highlights from Save My Day (flowmind_today_plan)
+    // =====================================
+    // REALTIME FIREBASE SUBSCRIPTION
+    // =====================================
     useEffect(() => {
-        const smdPlan = localStorage.getItem("flowmind_today_plan");
-        if (smdPlan) {
-            try {
-                const parsed = JSON.parse(smdPlan);
-                if (Array.isArray(parsed.strictlyDoToday)) {
-                    // Extract just the task titles to match against our board tasks
-                    const titles = parsed.strictlyDoToday.map(t => typeof t === 'string' ? t : t.task);
-                    setTodayPlanTasks(titles);
-                }
-            } catch (e) {
-                console.error("Failed to parse flowmind_today_plan for TaskBoard", e);
-            }
+        const unsubscribe = subscribeToPlan((realtimePlan) => {
+            latestPlanRef.current = realtimePlan;
+            setIsLoading(false);
+            setError(null);
+            setTasks(getPlanTasks(realtimePlan));
+        });
+
+        return () => {
+            if (unsubscribe) unsubscribe();
+            if (deleteTimeoutRef.current) clearTimeout(deleteTimeoutRef.current);
+        };
+    }, []);
+
+    // =====================================
+    // GLOBAL SYNC ENGINE
+    // =====================================
+    const syncPlanUpdates = useCallback(async (updatedTasks) => {
+        const completedCount = updatedTasks.filter(t => t.status === "Completed").length;
+        const total = updatedTasks.length;
+        const progress = total === 0 ? 0 : Math.round((completedCount / total) * 100);
+        const currentConfidence = Number(latestPlanRef.current?.confidenceScore);
+        const planUpdates = { taskBoardTasks: updatedTasks };
+
+        if (Number.isFinite(currentConfidence)) {
+            planUpdates.confidenceScore = Math.min(100, Math.max(currentConfidence, progress));
+        }
+
+        try {
+            const didSave = await savePlan(planUpdates);
+            if (!didSave) throw new Error("Firebase rejected the task update");
+        } catch (err) {
+            console.error("Failed to sync plan updates to cloud", err);
+            setError("Task sync failed. Please try again.");
         }
     }, []);
 
-    // Task Database 
-    // Point 1 & 2: Subtasks are now objects with `completed` states.
-    const [tasks, setTasks] = useState([
-        {
-            id: 1,
-            title: "AQI Project",
-            priority: "High",
-            deadlineDays: 5,
-            estimatedTime: "4 Hours",
-            timeBlock: "10:00 AM - 2:00 PM",
-            category: "Project",
-            status: "To Do",
-            subtasks: [
-                { id: "s1", title: "Research", completed: false },
-                { id: "s2", title: "Documentation", completed: false },
-                { id: "s3", title: "PPT", completed: false },
-                { id: "s4", title: "Testing", completed: false },
-                { id: "s5", title: "Final Review", completed: false }
-            ],
-            gain: 8
-        },
-        {
-            id: 2,
-            title: "Homework Submission",
-            priority: "High",
-            deadlineDays: 1,
-            estimatedTime: "2 Hours",
-            timeBlock: "3:00 PM - 5:00 PM",
-            category: "Academics",
-            status: "In Progress",
-            // Empty subtasks -> AI Plan section completely hidden
-            subtasks: [], 
-            gain: 8
-        },
-        {
-            id: 3,
-            title: "Deloitte Preparation",
-            priority: "Medium",
-            deadlineDays: 15,
-            estimatedTime: "1 Hour",
-            timeBlock: "6:00 PM - 7:00 PM",
-            category: "Placement",
-            status: "To Do",
-            subtasks: [
-                { id: "s6", title: "Quant Mock Test", completed: false },
-                { id: "s7", title: "Logical Reasoning Review", completed: false }
-            ],
-            gain: 3
-        }
-    ]);
+    // =====================================
+    // OPTIMISTIC MUTATION & FOCUS HANDLERS
+    // =====================================
+    const triggerCelebration = useCallback(() => {
+        setCelebration("🔥 Great progress! Keep going.");
+        setTimeout(() => setCelebration(null), 3000);
+    }, []);
 
-    const priorityWeights = { HIGH: 3, MEDIUM: 2, LOW: 1 };
-
-    // Dashboard Sync Helper (Point 4)
-    // Synchronizes progress to master plan confidence score without page refresh
-    const syncProgressToDashboard = (updatedTasks) => {
-        const completedCount = updatedTasks.filter(t => t.status === "Completed").length;
-        const masterPlan = localStorage.getItem("flowmind_plan");
-        if (masterPlan) {
-            try {
-                let parsed = JSON.parse(masterPlan);
-                // Artificially bump confidence score in background
-                parsed.confidenceScore = Math.min(100, (parsed.confidenceScore || 60) + (completedCount * 3));
-                localStorage.setItem("flowmind_plan", JSON.stringify(parsed));
-            } catch (e) {
-                console.error("Dashboard sync failed", e);
-            }
-        }
-    };
-
-    // Header Metrics Engine
-    const totalTasks = tasks.length;
-    const completedTasks = tasks.filter(t => t.status === "Completed").length;
-    const progressPercent = totalTasks === 0 ? 0 : Math.round((completedTasks / totalTasks) * 100);
-
-    const getProgressStatus = (pct, count) => {
-        if (count === 0) return { label: "GET STARTED", color: "bg-purple-500/15 text-purple-400 border-purple-500/30", bar: "bg-purple-500" };
-        if (pct >= 80) return { label: "ON TRACK", color: "bg-green-500/15 text-green-400 border-green-500/20", bar: "bg-green-500" };
-        if (pct >= 50) return { label: "AT RISK", color: "bg-amber-500/15 text-amber-400 border-amber-500/20", bar: "bg-amber-500" };
-        return { label: "CRITICAL", color: "bg-red-500/15 text-red-400 border-red-500/20", bar: "bg-red-500" };
-    };
-
-    const currentProgressStatus = getProgressStatus(progressPercent, completedTasks);
-
-    // AI Recalculating trigger (approx 2 seconds)
-    const triggerRecalculation = (isCompletion = false) => {
-        setAiState("recalculating");
-        setTimeout(() => {
-            if (isCompletion) {
-                setAiState("success");
-                setTimeout(() => setAiState(null), 2000);
-            } else {
-                setAiState(null);
-            }
-        }, 1800); // Set near 2 seconds as requested
-    };
-
-    const moveTask = (taskId, newStatus) => {
-        const updated = tasks.map(t => t.id === taskId ? { ...t, status: newStatus } : t);
-        setTasks(updated);
-        triggerRecalculation(newStatus === "Completed");
-        syncProgressToDashboard(updated);
-    };
-
-    // Subtask Interactivity Engine (Points 1 & 2 & 5)
-    const toggleSubtask = (taskId, subtaskId) => {
-        setTasks(prev => prev.map(t => {
-            if (t.id === taskId) {
-                const updatedSubtasks = t.subtasks.map(s => s.id === subtaskId ? { ...s, completed: !s.completed } : s);
-                return { ...t, subtasks: updatedSubtasks };
-            }
-            return t;
-        }));
-        // Trigger AI logic on subtask change
-        triggerRecalculation(false);
-    };
-    const handleNLSubmit = (e) => {
-        e.preventDefault();
-        if (!nlInput.trim()) return;
+    const handleCompleteWithAnimation = useCallback((taskId) => {
+        setCompletingId(taskId);
         
-        triggerRecalculation(false);
-
+        // CSS glow & collapse animation timeout
         setTimeout(() => {
-            const lowerInput = nlInput.toLowerCase();
-            const isComplex = lowerInput.includes("project") || lowerInput.includes("prep") || lowerInput.includes("exam");
+            setCompletingId(null);
+            setTasks(prev => {
+                const updated = prev.map(t => {
+                    if (t.id === taskId) {
+                        return { ...t, status: "Completed", currentCount: t.targetCount || t.currentCount };
+                    }
+                    return t;
+                });
+                syncPlanUpdates(updated);
+                return updated;
+            });
+            triggerCelebration();
             
-            const autoGeneratedSubtasks = isComplex 
-                ? [
-                    { id: Date.now() + 1, title: "Research & Scope", completed: false },
-                    { id: Date.now() + 2, title: "Core Implementation", completed: false },
-                    { id: Date.now() + 3, title: "Draft Review", completed: false },
-                    { id: Date.now() + 4, title: "Final QA & Submit", completed: false }
-                  ] 
-                : [];
+            if (focusedTaskId === taskId) {
+                setFocusedTaskId(null);
+            }
+        }, 400);
+    }, [focusedTaskId, syncPlanUpdates, triggerCelebration]);
 
-            const newTask = {
-                id: Date.now(),
-                title: nlInput.split(" due")[0] || "New AI Task",
-                priority: lowerInput.includes("urgent") ? "High" : "Medium",
-                deadlineDays: lowerInput.includes("tomorrow") ? 1 : (lowerInput.includes("friday") ? 3 : 5),
-                estimatedTime: lowerInput.includes("hours") ? "4 Hours" : "2 Hours",
-                timeBlock: "Flexible Block",
-                category: lowerInput.includes("project") ? "Project" : "Academics",
-                status: "To Do",
-                subtasks: autoGeneratedSubtasks,
-                gain: isComplex ? 6 : 3
-            };
+    const handleIncrementRepeating = useCallback((taskId) => {
+        setTasks(prev => {
+            let shouldComplete = false;
+            const updated = prev.map(t => {
+                if (t.id === taskId) {
+                    const nextCount = (t.currentCount || 0) + 1;
+                    if (nextCount >= t.targetCount) {
+                        shouldComplete = true;
+                    }
+                    return { ...t, currentCount: nextCount };
+                }
+                return t;
+            });
+            
+            if (shouldComplete) {
+                setTimeout(() => handleCompleteWithAnimation(taskId), 250);
+            } else {
+                syncPlanUpdates(updated);
+            }
+            return updated;
+        });
+    }, [handleCompleteWithAnimation, syncPlanUpdates]);
 
-            const updatedTasks = [newTask, ...tasks];
-            setTasks(updatedTasks);
-            setNlInput("");
-            syncProgressToDashboard(updatedTasks);
-        }, 800);
-    };
+    const handleDeleteTask = useCallback((task) => {
+        // Optimistic Remove
+        const previousTasks = [...tasks];
+        const updatedTasks = tasks.filter(t => t.id !== task.id);
+        setTasks(updatedTasks);
+        
+        if (focusedTaskId === task.id) setFocusedTaskId(null);
 
-    const recommendedAction = useMemo(() => {
-        const pending = tasks.filter(t => t.status !== "Completed");
-        if (pending.length === 0) return null;
-        return [...pending].sort((a, b) => {
-            if (a.deadlineDays !== b.deadlineDays) return a.deadlineDays - b.deadlineDays;
-            return (priorityWeights[b.priority.toUpperCase()] || 0) - (priorityWeights[a.priority.toUpperCase()] || 0);
-        })[0];
+        // Modern Undo Toast Setup
+        setDeletedTaskInfo({ task, previousTasks });
+        if (deleteTimeoutRef.current) clearTimeout(deleteTimeoutRef.current);
+        
+        deleteTimeoutRef.current = setTimeout(() => {
+            setDeletedTaskInfo(null);
+            syncPlanUpdates(updatedTasks);
+        }, 5000);
+    }, [tasks, focusedTaskId, syncPlanUpdates]);
+
+    const handleUndoDelete = useCallback(() => {
+        if (!deletedTaskInfo) return;
+        if (deleteTimeoutRef.current) clearTimeout(deleteTimeoutRef.current);
+        setTasks(deletedTaskInfo.previousTasks);
+        setDeletedTaskInfo(null);
+    }, [deletedTaskInfo]);
+
+    const handleDismissDelete = useCallback(() => {
+        if (!deletedTaskInfo) return;
+        if (deleteTimeoutRef.current) clearTimeout(deleteTimeoutRef.current);
+        syncPlanUpdates(tasks);
+        setDeletedTaskInfo(null);
+    }, [deletedTaskInfo, syncPlanUpdates, tasks]);
+
+    // Focus & Notes Handlers
+    const handleToggleFocus = useCallback((task) => {
+        if (focusedTaskId === task.id) {
+            setFocusedTaskId(null);
+            const updated = tasks.map(t => t.id === task.id ? { ...t, notes: activeNoteContent } : t);
+            setTasks(updated);
+            syncPlanUpdates(updated);
+        } else {
+            if (focusedTaskId) {
+                const currentTasks = tasks.map(t => t.id === focusedTaskId ? { ...t, notes: activeNoteContent } : t);
+                setTasks(currentTasks);
+                syncPlanUpdates(currentTasks);
+            }
+            setFocusedTaskId(task.id);
+            setActiveNoteContent(task.notes || "");
+            setNotesSaved(false);
+        }
+    }, [focusedTaskId, tasks, activeNoteContent, syncPlanUpdates]);
+
+    const handleNotesChange = (e) => setActiveNoteContent(e.target.value);
+
+    const handleNotesBlur = useCallback(() => {
+        if (!focusedTaskId) return;
+        const updated = tasks.map(t => t.id === focusedTaskId ? { ...t, notes: activeNoteContent } : t);
+        setTasks(updated);
+        syncPlanUpdates(updated);
+        setNotesSaved(true);
+        setTimeout(() => setNotesSaved(false), 2000);
+    }, [focusedTaskId, activeNoteContent, tasks, syncPlanUpdates]);
+
+    // =====================================
+    // SMART SORTING & DERIVED STATE
+    // =====================================
+    const activeTasks = useMemo(() => {
+        return tasks
+            .filter(t => t.status !== "Completed")
+            .sort((a, b) => {
+                const pA = priorityWeights[a.priority?.toUpperCase()] || 0;
+                const pB = priorityWeights[b.priority?.toUpperCase()] || 0;
+                if (pA !== pB) return pB - pA; 
+
+                const dA = a.deadlineDays || 0;
+                const dB = b.deadlineDays || 0;
+                if (dA !== dB) return dA - dB;
+
+                const durA = parseDuration(a.estimatedTime);
+                const durB = parseDuration(b.estimatedTime);
+                if (durA !== durB) return durA - durB;
+
+                return (a.id || 0) - (b.id || 0);
+            });
     }, [tasks]);
 
-    const location = useLocation();
+    const completedTasksList = useMemo(() => tasks.filter(t => t.status === "Completed"), [tasks]);
+    const upcomingTasks = useMemo(() => [...activeTasks].sort((a, b) => (a.deadlineDays || 0) - (b.deadlineDays || 0)).slice(0, 4), [activeTasks]);
 
-    useEffect(() => {
-        if (location && location.state && location.state.highlight) {
-            const title = location.state.highlight;
-            try {
-                const safe = title.replace(/"/g, '\\"');
-                const selector = `[data-task-title="${safe}"]`;
-                const el = document.querySelector(selector);
-                if (el) {
-                    el.scrollIntoView({ behavior: 'smooth', block: 'center' });
-                    el.classList.add('ring-2', 'ring-yellow-400', 'ring-offset-2');
-                    setTimeout(() => {
-                        el.classList.remove('ring-2', 'ring-yellow-400', 'ring-offset-2');
-                    }, 4000);
-                }
-            } catch (e) {
-                console.error('Highlight scroll failed', e);
-            }
-        }
-    }, [location, tasks]);
+    // Header Metrics
+    const totalTasksCount = activeTasks.length + completedTasksList.length;
+    const completedCount = completedTasksList.length;
+    const progressPercent = totalTasksCount === 0 ? 0 : Math.round((completedCount / totalTasksCount) * 100);
+    const isOnlyRepeatingLeft = activeTasks.length > 0 && activeTasks.every(t => t.isRepeating);
 
-    const getDeadlineColor = (days) => {
-        if (days <= 2) return "text-red-400 font-bold";
-        if (days <= 7) return "text-amber-400 font-semibold";
-        return "text-green-400";
-    };
+    // Styling Helpers
+    const getPriorityStyles = useCallback((priority) => {
+        const p = (priority || "MEDIUM").toUpperCase();
+        if (p === "HIGH") return "bg-red-50 text-red-600 border-red-100";
+        if (p === "MEDIUM") return "bg-amber-50 text-amber-600 border-amber-100";
+        return "bg-green-50 text-green-600 border-green-100";
+    }, []);
 
-    const getGainBadgeStyles = (gain) => {
-        if (gain >= 5) return "bg-green-500/10 text-green-400 border-green-500/20";
-        if (gain >= 3) return "bg-yellow-500/10 text-yellow-400 border-yellow-500/20";
-        return "bg-zinc-800 text-zinc-400 border-zinc-700";
-    };
+    const getDeadlineColor = useCallback((days) => {
+        if (days <= 2) return "text-red-500 font-bold";
+        if (days <= 7) return "text-amber-500 font-bold";
+        return "text-green-500";
+    }, []);
 
-    const getPriorityStyles = (priority) => {
-        const p = priority.toUpperCase();
-        if (p === "HIGH") return "bg-red-500/10 text-red-400 border-red-500/20";
-        if (p === "MEDIUM") return "bg-amber-500/10 text-amber-400 border-amber-500/20";
-        return "bg-green-500/10 text-green-400 border-green-500/20";
-    };
+    const ringRadius = 14;
+    const ringCircumference = 2 * Math.PI * ringRadius;
+    const ringOffset = ringCircumference - (progressPercent / 100) * ringCircumference;
 
-    const getCategoryStyles = (category) => {
-        const c = category.toLowerCase();
-        if (c === "project") return "bg-purple-500/10 text-purple-400 border-purple-500/20";
-        if (c === "placement") return "bg-blue-500/10 text-blue-400 border-blue-500/20";
-        return "bg-green-500/10 text-green-400 border-green-500/20";
-    };
+    /* Future Hooks Prepped:
+       [ ] Focus Timer Integration 
+       [ ] Dashboard Repeating Progress Sync 
+       [ ] File Attachments Component 
+       [ ] Subtasks Engine
+    */
 
     return (
-        <MainLayout>
-            <div className="min-h-screen bg-[#09090B] text-white space-y-6 p-4 md:p-6 pb-12 relative select-none">
+        <>
+            <style>{`
+                html { scroll-behavior: smooth; }
+                ::-webkit-scrollbar { width: 6px; height: 6px; }
+                ::-webkit-scrollbar-track { background: transparent; }
+                ::-webkit-scrollbar-thumb { background: #E9DFD3; border-radius: 10px; }
+                ::-webkit-scrollbar-thumb:hover { background: #D6C6FF; }
+
+                @keyframes shimmer {
+                    0% { background-position: -200% 0; }
+                    100% { background-position: 200% 0; }
+                }
+                .skeleton-shimmer {
+                    background: linear-gradient(90deg, #F3EBE1 25%, #FFFDFB 50%, #F3EBE1 75%);
+                    background-size: 200% 100%;
+                    animation: shimmer 1.6s infinite linear;
+                }
+                @keyframes slideUpFade {
+                    0% { opacity: 0; transform: translateY(10px); }
+                    100% { opacity: 1; transform: translateY(0); }
+                }
+                .animate-fade-in-up { animation: slideUpFade 0.3s cubic-bezier(0.16, 1, 0.3, 1) forwards; }
+            `}</style>
+            
+            <div className="relative min-h-screen bg-transparent text-gray-800 font-sans pb-16">
                 
-                {/* AI Recalculating Overlay & Success Toast */}
-                {aiState === "recalculating" && (
-                    <div className="fixed top-6 left-1/2 -translate-x-1/2 z-50 bg-purple-600 text-white px-6 py-2.5 rounded-full shadow-lg shadow-purple-600/30 border border-purple-400 animate-pulse flex items-center gap-2.5">
-                        <span className="text-sm">⚡</span>
-                        <span className="font-bold tracking-wide uppercase text-xs">AI Recalculating...</span>
+                {/* Background Ambient Blobs */}
+                <div className="pointer-events-none absolute top-0 right-0 w-[600px] h-[600px] bg-[#D6C6FF] rounded-full filter blur-[120px] opacity-[0.12] z-0"></div>
+                <div className="pointer-events-none absolute bottom-0 left-0 w-[600px] h-[600px] bg-[#A7F3D0] rounded-full filter blur-[120px] opacity-[0.12] z-0"></div>
+
+                {/* CELEBRATION TOAST */}
+                {celebration && (
+                    <div className="fixed top-6 left-1/2 -translate-x-1/2 z-[150] bg-white text-gray-900 px-6 py-3 rounded-xl shadow-[0_10px_40px_rgba(34,197,94,0.2)] border border-green-200 animate-fade-in-up flex items-center gap-3">
+                        <span className="text-sm font-bold tracking-wide text-green-600">{celebration}</span>
                     </div>
                 )}
-                
-                {aiState === "success" && (
-                    <div className="fixed top-6 left-1/2 -translate-x-1/2 z-50 bg-[#18181B] text-white px-6 py-3 rounded-xl shadow-xl shadow-green-950/40 border border-green-500 flex items-center gap-3 animate-bounce">
-                        <span className="text-xl">✅</span>
-                        <div>
-                            <p className="text-xs font-bold uppercase tracking-wider text-green-400">Task Completed</p>
-                            <p className="text-[10px] text-zinc-400">Confidence Score Updated</p>
+
+                {/* UNDO DELETE TOAST (POLISHED) */}
+                {deletedTaskInfo && (
+                    <div className="fixed bottom-6 left-1/2 -translate-x-1/2 z-[150] bg-gray-900 text-white px-5 py-3 rounded-xl shadow-2xl animate-fade-in-up flex items-center gap-6">
+                        <span className="text-sm font-semibold text-gray-200">Task deleted</span>
+                        <div className="flex items-center gap-3 border-l border-gray-700 pl-3">
+                            <button 
+                                onClick={handleUndoDelete}
+                                className="text-xs font-black text-purple-400 hover:text-purple-300 transition-colors uppercase tracking-wider focus:outline-none focus-visible:ring-2 focus-visible:ring-purple-500 rounded"
+                            >
+                                Undo
+                            </button>
+                            <button 
+                                onClick={handleDismissDelete}
+                                className="text-xs font-bold text-gray-400 hover:text-gray-200 transition-colors focus:outline-none focus-visible:ring-2 focus-visible:ring-gray-400 rounded px-1"
+                            >
+                                Dismiss
+                            </button>
                         </div>
                     </div>
                 )}
 
-                {/* Section 1: Header */}
-                <div className="flex flex-col md:flex-row md:items-center justify-between p-6 bg-[#18181B] rounded-xl border border-[#27272A] gap-4">
-                    <div>
-                        <h1 className="text-2xl font-bold tracking-tight">Task Board</h1>
-                        <p className="text-sm text-zinc-400 mt-1">Manage and execute your AI-generated plan.</p>
-                    </div>
+                <div className="relative z-10 max-w-[1510px] mx-auto px-5 py-6 lg:px-7 lg:py-8 w-full animate-fade-in-up">
                     
-                    {/* Execution Progress Badge */}
-                    <div className="bg-[#09090B] border border-[#27272A] rounded-xl p-4 min-w-[280px]">
-                        <h3 className="text-[10px] uppercase tracking-widest text-zinc-500 font-bold mb-2">Execution Progress</h3>
-                        <div className="flex items-end gap-3 mb-1">
-                            <span className="text-3xl font-black text-white leading-none">{progressPercent}%</span>
-                            <span className={`px-2 py-0.5 text-[10px] font-black uppercase rounded border transition-all duration-300 ${currentProgressStatus.color}`}>
-                                {currentProgressStatus.label}
-                            </span>
+                    {/* =====================================
+                        HERO SECTION
+                    ===================================== */}
+                    <div className="flex flex-col md:flex-row md:items-center justify-between mb-8 gap-4">
+                        <div>
+                            <h2 className="text-[#A09486] text-[11px] font-black uppercase tracking-[0.18em] mb-1">Good Morning, Ayush</h2>
+                            <h1 className="text-4xl font-black tracking-tight text-gray-950 leading-tight">Today's Execution</h1>
+                            <p className="text-sm font-medium text-gray-500 mt-1">Focus on what matters most today. Complete one meaningful task at a time.</p>
                         </div>
-                        <p className="text-xs text-zinc-400 font-medium mb-3">{completedTasks} / {totalTasks} Tasks Completed</p>
-                        <div className="w-full bg-zinc-800 rounded-full h-1.5">
-                            <div className={`${currentProgressStatus.bar} h-1.5 rounded-full transition-all duration-500`} style={{ width: `${progressPercent}%` }}></div>
-                        </div>
-                    </div>
-                </div>
-
-                {/* Section 2: Smart NLP Input */}
-                <form onSubmit={handleNLSubmit} className="relative">
-                    <input 
-                        type="text" 
-                        placeholder="Try typing: 'AQI project due Friday 4 hours' vs 'Homework due tomorrow'..."
-                        value={nlInput}
-                        onChange={(e) => setNlInput(e.target.value)}
-                        className="w-full bg-[#18181B] border border-[#27272A] rounded-xl p-4 pr-32 text-sm text-white placeholder-zinc-500 focus:outline-none focus:border-purple-500 transition-colors"
-                    />
-                    <button 
-                        type="submit"
-                        disabled={aiState === "recalculating" || !nlInput.trim()}
-                        className="absolute right-2 top-2 bottom-2 bg-purple-600 hover:bg-purple-700 disabled:opacity-50 text-white text-xs font-bold px-4 rounded-lg transition-colors"
-                    >
-                        Generate Task
-                    </button>
-                </form>
-
-                {/* Section 3: Dynamic Recommendation Alert */}
-                {recommendedAction && (
-                    <div className="p-5 bg-gradient-to-r from-[#18181B] to-purple-950/10 rounded-xl border border-purple-500/20 shadow-lg shadow-purple-900/5">
-                        <div className="flex items-center gap-2 mb-2">
-                            <span className="text-purple-400 text-lg">🤖</span>
-                            <h3 className="text-purple-400 text-xs font-black uppercase tracking-widest">AI Recommended Action</h3>
-                        </div>
-                        <h4 className="text-xl font-bold text-white mb-2">Complete {recommendedAction.title}</h4>
-                        <p className="text-sm text-zinc-400 border-l-2 border-purple-500 pl-3">
-                            <span className="font-semibold text-zinc-300">Reason:</span> Deadline in {recommendedAction.deadlineDays} days and highest impact task currently pending.
-                        </p>
-                    </div>
-                )}
-
-                {/* Filters */}
-                <div className="flex flex-wrap gap-2">
-                    {["All", "High Priority", "Today", "Overdue", "Completed"].map(f => (
-                        <button 
-                            key={f}
-                            onClick={() => setFilter(f)}
-                            className={`px-4 py-1.5 rounded-full text-xs font-bold transition-all ${
-                                filter === f 
-                                ? "bg-purple-600 text-white shadow-md shadow-purple-600/20" 
-                                : "bg-[#18181B] text-zinc-400 border border-[#27272A] hover:text-white"
-                            }`}
-                        >
-                            {f}
-                        </button>
-                    ))}
-                </div>
-
-                {/* Sorted Kanban Columns */}
-                <div className="grid grid-cols-1 lg:grid-cols-3 gap-6 items-start">
-                    {["To Do", "In Progress", "Completed"].map(columnStatus => {
                         
-                        const columnTasks = tasks
-                            .filter(t => {
-                                if (filter === "All") return t.status === columnStatus;
-                                if (filter === "High Priority") return t.status === columnStatus && t.priority === "High";
-                                if (filter === "Completed") return t.status === "Completed" && columnStatus === "Completed";
-                                if (filter === "Today" || filter === "Overdue") return t.status === columnStatus && t.deadlineDays <= 1;
-                                return t.status === columnStatus;
-                            })
-                            .sort((a, b) => (priorityWeights[b.priority.toUpperCase()] || 0) - (priorityWeights[a.priority.toUpperCase()] || 0));
+                        <div className="flex items-center gap-3 bg-white/95 px-4 py-3 rounded-[18px] border border-[#E9DFD3] shadow-[0_8px_24px_rgba(80,62,38,0.04)]">
+                            <div className="relative w-9 h-9 flex items-center justify-center shrink-0">
+                                <svg className="transform -rotate-90 w-full h-full drop-shadow-sm">
+                                    <circle cx="18" cy="18" r={ringRadius} stroke="currentColor" strokeWidth="3" fill="transparent" className="text-gray-100" />
+                                    <circle cx="18" cy="18" r={ringRadius} stroke="currentColor" strokeWidth="3" fill="transparent" strokeDasharray={ringCircumference} strokeDashoffset={ringOffset} strokeLinecap="round" className="text-purple-600 transition-all duration-1000" style={{ transitionTimingFunction: 'cubic-bezier(0.175, 0.885, 0.32, 1.275)' }} />
+                                </svg>
+                            </div>
+                            <div className="flex flex-col">
+                                <span className="text-[10px] font-black uppercase tracking-widest text-gray-400">Progress</span>
+                                <span className="text-sm font-black text-gray-950">{completedCount} <span className="text-gray-400 font-semibold">/ {totalTasksCount}</span></span>
+                            </div>
+                        </div>
+                    </div>
 
-                        return (
-                            <div key={columnStatus} className="bg-[#18181B]/50 rounded-xl p-4 border border-[#27272A]/50 min-h-[500px] flex flex-col">
-                                <h3 className="text-xs font-black uppercase tracking-widest text-zinc-500 mb-4 flex items-center justify-between">
-                                    <span>{columnStatus} <span className="text-purple-400 font-mono">({columnTasks.length})</span></span>
-                                </h3>
+                    {/* =====================================
+                        QUICK STATS ROW
+                    ===================================== */}
+                    <div className="grid grid-cols-2 md:grid-cols-4 gap-4 mb-8">
+                        <div className="bg-white rounded-2xl border border-[#E9DFD3]/80 p-4 shadow-[0_4px_20px_rgba(80,62,38,0.03)] flex flex-col justify-center">
+                            <span className="text-[10px] font-black uppercase tracking-widest text-gray-400 mb-1">Today's Tasks</span>
+                            <span className="text-2xl font-black text-gray-900">{activeTasks.length}</span>
+                        </div>
+                        <div className="bg-white rounded-2xl border border-[#E9DFD3]/80 p-4 shadow-[0_4px_20px_rgba(80,62,38,0.03)] flex flex-col justify-center">
+                            <span className="text-[10px] font-black uppercase tracking-widest text-gray-400 mb-1">Completed</span>
+                            <span className="text-2xl font-black text-green-600">{completedCount}</span>
+                        </div>
+                        <div className="bg-white rounded-2xl border border-[#E9DFD3]/80 p-4 shadow-[0_4px_20px_rgba(80,62,38,0.03)] flex flex-col justify-center">
+                            <span className="text-[10px] font-black uppercase tracking-widest text-gray-400 mb-1">Focus Time</span>
+                            <span className="text-2xl font-black text-gray-900">4.5<span className="text-sm font-semibold text-gray-400 ml-1">hrs</span></span>
+                        </div>
+                        <div className="bg-white rounded-2xl border border-[#E9DFD3]/80 p-4 shadow-[0_4px_20px_rgba(80,62,38,0.03)] flex flex-col justify-center">
+                            <span className="text-[10px] font-black uppercase tracking-widest text-gray-400 mb-1">Current Streak</span>
+                            <div className="flex items-center gap-2">
+                                <span className="text-2xl font-black text-purple-600">12</span>
+                                <span className="text-lg">🔥</span>
+                            </div>
+                        </div>
+                    </div>
 
-                                <div className="space-y-4 flex-1">
-                                    {/* Empty State */}
-                                    {columnTasks.length === 0 && (
-                                        <div className="h-48 flex flex-col items-center justify-center text-center p-6 border-2 border-dashed border-[#27272A] rounded-xl opacity-50">
-                                            {columnStatus === "Completed" ? (
-                                                <>
-                                                    <p className="text-sm font-bold text-zinc-200 mb-1">✅ No completed tasks yet</p>
-                                                    <p className="text-xs text-zinc-400 max-w-[220px] leading-relaxed">Complete your first task to improve your confidence score.</p>
-                                                </>
-                                            ) : (
-                                                <p className="text-xs font-bold text-zinc-500">No tasks currently processing.</p>
-                                            )}
+                    {/* =====================================
+                        MAIN LAYOUT
+                    ===================================== */}
+                    <div className="flex flex-col lg:flex-row gap-6">
+                        
+                        {/* LEFT COLUMN: Active Execution */}
+                        <div className="w-full lg:w-3/4 flex flex-col gap-4">
+                            <div className="flex items-center justify-between mb-2">
+                                <div className="flex items-center gap-3">
+                                    <h3 className="text-lg font-black tracking-tight text-gray-950 flex items-center gap-2">
+                                        🎯 Active Execution
+                                    </h3>
+                                    <span className="text-[10px] font-bold text-gray-400 bg-gray-50 px-2 py-1 rounded-md border border-gray-100 hidden sm:inline-block">Sorted by: Priority • Deadline</span>
+                                </div>
+                            </div>
+
+                            {isLoading ? (
+                                <div className="flex flex-col gap-4">
+                                    {[1, 2, 3].map(i => (
+                                        <div key={i} className="bg-white p-5 rounded-[22px] border border-[#E9DFD3]/80 shadow-sm flex gap-4">
+                                            <div className="w-6 h-6 rounded-md skeleton-shimmer mt-0.5 shrink-0"></div>
+                                            <div className="flex-1 space-y-3 py-1">
+                                                <div className="h-5 skeleton-shimmer rounded w-1/3"></div>
+                                                <div className="h-4 skeleton-shimmer rounded w-1/4"></div>
+                                            </div>
                                         </div>
-                                    )}
-
-                                    {/* Render Task Cards */}
-                                    {columnTasks.map(task => {
-                                        // Save My Day Integration checking
-                                        const isTodayPlan = todayPlanTasks.includes(task.title);
-
+                                    ))}
+                                </div>
+                            ) : error ? (
+                                <div className="bg-red-50 text-red-600 p-6 rounded-xl border border-red-100 text-center font-bold">
+                                    {error}
+                                </div>
+                            ) : activeTasks.length > 0 ? (
+                                <div className="flex flex-col gap-4">
+                                    {activeTasks.map((task) => {
+                                        const isFocused = focusedTaskId === task.id;
+                                        const isCompleting = completingId === task.id;
+                                        
                                         return (
                                             <div 
-                                                key={task.id}
-                                                data-task-title={task.title}
-                                                className={`bg-[#09090B] p-4 rounded-xl border transition-all duration-200 hover:border-purple-500/50 hover:shadow-[0_0_15px_-3px_rgba(168,85,247,0.15)] ${
-                                                    task.status === "Completed" ? "opacity-50 border-[#27272A]" : (isTodayPlan ? "border-purple-500/50 shadow-[0_0_15px_-3px_rgba(168,85,247,0.15)] ring-1 ring-purple-500/20" : "border-[#27272A]")
+                                                key={task.id} 
+                                                className={`bg-white p-5 rounded-[22px] border transition-all duration-400 ease-out group flex flex-col gap-4 ${
+                                                    isCompleting 
+                                                    ? "opacity-50 scale-[0.99] shadow-[0_0_15px_rgba(34,197,94,0.05)] border-green-200" 
+                                                    : isFocused
+                                                        ? "border-purple-300 shadow-[0_16px_50px_rgba(126,34,206,0.1)] ring-4 ring-purple-500/10 scale-[1.01] z-10"
+                                                        : "border-[#E9DFD3]/80 shadow-[0_8px_24px_rgba(80,62,38,0.04)] hover:shadow-[0_14px_40px_rgba(80,62,38,0.08)] hover:-translate-y-0.5 hover:border-purple-200"
                                                 }`}
                                             >
-                                                {/* Header With "Save My Day" Badge */}
-                                                <div className="mb-2 flex justify-between items-start gap-2">
-                                                    <h4 className={`font-bold text-sm ${task.status === "Completed" ? "line-through text-zinc-500" : "text-zinc-100"}`}>
-                                                        {task.title}
-                                                    </h4>
-                                                    {isTodayPlan && task.status !== "Completed" && (
-                                                        <span className="bg-purple-600 text-white px-2 py-0.5 rounded text-[9px] font-black uppercase tracking-wider shadow-sm shadow-purple-500/40 whitespace-nowrap">
-                                                            Today's Plan
-                                                        </span>
-                                                    )}
-                                                </div>
-
-                                                <div className="flex flex-wrap gap-2 mb-4">
-                                                    <span className={`px-2 py-0.5 rounded text-[10px] font-black border uppercase ${getPriorityStyles(task.priority)}`}>
-                                                        {task.priority}
-                                                    </span>
-                                                    <span className={`px-2 py-0.5 rounded text-[10px] font-bold border ${getCategoryStyles(task.category)}`}>
-                                                        {task.category}
-                                                    </span>
-                                                </div>
-
-                                                <div className="space-y-2 mb-4 text-xs">
-                                                    <div className="flex items-center gap-2">
-                                                        <span className="w-4 text-center">⏳</span>
-                                                        <span className={getDeadlineColor(task.deadlineDays)}>
-                                                            {task.deadlineDays} Days Remaining
-                                                        </span>
-                                                    </div>
-                                                    <div className="flex items-center gap-2">
-                                                        <span className="w-4 text-center">⏱️</span>
-                                                        <span className="text-zinc-300">{task.estimatedTime}</span>
-                                                    </div>
-                                                    <div className="flex items-center gap-2">
-                                                        <span className="w-4 text-center text-purple-400">🤖</span>
-                                                        <span className="bg-purple-500/10 text-purple-400 border border-purple-500/20 px-2 py-0.5 rounded-full font-medium">
-                                                            🕒 {task.timeBlock}
-                                                        </span>
+                                                {/* Task Header Row */}
+                                                <div className="flex flex-col sm:flex-row sm:items-center justify-between gap-4">
+                                                    <div className="flex items-start gap-4 flex-1">
+                                                        
+                                                        {/* Checkbox / Repeating Stepper */}
+                                                        {task.isRepeating && task.targetCount > 1 ? (
+                                                            <button 
+                                                                onClick={(e) => { e.stopPropagation(); handleIncrementRepeating(task.id); }}
+                                                                className="w-12 h-6 rounded-md border-2 border-purple-200 mt-0.5 flex items-center justify-center shrink-0 hover:border-purple-400 bg-purple-50 text-purple-700 text-[10px] font-black tracking-widest active:scale-95 transition-all focus:outline-none focus-visible:ring-2 focus-visible:ring-purple-500"
+                                                                aria-label={`Log progress: ${task.currentCount || 0} out of ${task.targetCount}`}
+                                                            >
+                                                                {task.currentCount || 0}/{task.targetCount}
+                                                            </button>
+                                                        ) : (
+                                                            <button 
+                                                                onClick={(e) => { e.stopPropagation(); handleCompleteWithAnimation(task.id); }}
+                                                                className="w-6 h-6 rounded-md border-2 border-gray-200 mt-0.5 flex items-center justify-center shrink-0 hover:border-green-400 hover:bg-green-50 transition-colors bg-gray-50/50 active:scale-90 focus:outline-none focus-visible:ring-2 focus-visible:ring-green-500"
+                                                                aria-label="Mark task complete"
+                                                            >
+                                                                <svg className="w-3.5 h-3.5 text-green-500 opacity-0 hover:opacity-100 transition-opacity" fill="none" viewBox="0 0 24 24" stroke="currentColor" strokeWidth="3"><path strokeLinecap="round" strokeLinejoin="round" d="M5 13l4 4L19 7" /></svg>
+                                                            </button>
+                                                        )}
+                                                        
+                                                        <div className="flex flex-col flex-1 min-w-0">
+                                                            <div className="flex flex-wrap items-center gap-2 mb-1.5">
+                                                                <span className={`px-2 py-0.5 rounded text-[9px] font-black uppercase border tracking-wider ${getPriorityStyles(task.priority)}`}>
+                                                                    {task.priority || "MEDIUM"}
+                                                                </span>
+                                                                <span className="px-2 py-0.5 rounded text-[9px] font-bold uppercase bg-gray-50 text-gray-500 border border-gray-100 tracking-wider">
+                                                                    Due in {task.deadlineDays || 1} {(task.deadlineDays || 1) === 1 ? 'day' : 'days'}
+                                                                </span>
+                                                            </div>
+                                                            <h4 className="text-base font-black text-gray-900 mb-1 truncate">{task.title}</h4>
+                                                            
+                                                            {/* Contextual Sub-elements */}
+                                                            <div className="flex flex-col gap-2">
+                                                                {!isFocused && (
+                                                                    <div className="flex items-center gap-3">
+                                                                        <span className="text-[11px] font-semibold text-gray-500 flex items-center gap-1">
+                                                                            <span className="text-[14px]">⏱</span> {task.estimatedTime || "1 Hour"}
+                                                                        </span>
+                                                                        <span className="text-[11px] font-semibold text-purple-600 bg-purple-50 px-2 py-0.5 rounded-md flex items-center gap-1">
+                                                                            🤖 {task.timeBlock || "Focus Block"}
+                                                                        </span>
+                                                                    </div>
+                                                                )}
+                                                                
+                                                                {/* Repeating Task Progress Inline Bar */}
+                                                                {task.isRepeating && task.targetCount > 1 && (
+                                                                    <div className="mt-1 max-w-[180px] animate-fade-in-up">
+                                                                        <div className="flex items-center justify-between text-[9px] font-bold text-gray-400 mb-1 uppercase tracking-wider">
+                                                                            <span>Progress</span>
+                                                                            <span>{task.targetCount - (task.currentCount || 0)} left</span>
+                                                                        </div>
+                                                                        <div className="w-full bg-gray-100 rounded-full h-1.5 overflow-hidden">
+                                                                             <div className="bg-purple-500 h-1.5 rounded-full transition-all duration-300 ease-out" style={{ width: `${((task.currentCount || 0)/task.targetCount)*100}%` }}></div>
+                                                                        </div>
+                                                                    </div>
+                                                                )}
+                                                            </div>
+                                                        </div>
                                                     </div>
                                                     
-                                                    {task.status !== "Completed" && (
-                                                        <div className="pt-1">
-                                                            <span className={`px-2 py-0.5 rounded text-[10px] font-bold border ${getGainBadgeStyles(task.gain)}`}>
-                                                                +{task.gain}% Confidence Gain
-                                                            </span>
-                                                        </div>
-                                                    )}
+                                                    <div className="shrink-0 flex items-center gap-2">
+                                                        {!isFocused && (
+                                                            <button 
+                                                                onClick={(e) => { e.stopPropagation(); handleDeleteTask(task); }}
+                                                                className="w-10 h-10 flex items-center justify-center text-gray-300 hover:text-red-500 hover:bg-red-50 rounded-xl transition-all opacity-0 group-hover:opacity-100 focus:opacity-100 active:scale-90 focus:outline-none focus-visible:ring-2 focus-visible:ring-red-400"
+                                                                aria-label="Delete task"
+                                                            >
+                                                                ✖
+                                                            </button>
+                                                        )}
+                                                        <button 
+                                                            onClick={() => handleToggleFocus(task)}
+                                                            className={`w-full sm:w-auto px-6 py-3 border rounded-xl font-bold text-xs transition-colors flex items-center justify-center gap-2 shadow-sm active:scale-95 focus:outline-none focus-visible:ring-2 focus-visible:ring-purple-500 ${
+                                                                isFocused 
+                                                                ? "bg-purple-600 text-white border-purple-600 shadow-purple-600/20" 
+                                                                : "bg-[#FAF8F4] hover:bg-purple-50 text-gray-900 border-[#EFE5D9] group-hover:border-purple-200"
+                                                            }`}
+                                                        >
+                                                            {isFocused ? "Collapse" : "▶ Start Focus"}
+                                                        </button>
+                                                    </div>
                                                 </div>
 
-                                                {/* Point 1 & 2: Conditionally render AI Generated Plan with Progress Bar */}
-                                                {task.subtasks && task.subtasks.length > 0 && (
-                                                    <div className="mb-4 pt-3 border-t border-[#27272A] space-y-2 bg-purple-950/10 -mx-4 p-4 border-y border-purple-500/10">
-                                                        <div className="flex items-center gap-1.5 mb-3">
-                                                            <span className="text-xs">🤖</span>
-                                                            <span className="text-xs font-bold text-purple-400 tracking-wide uppercase">AI Generated Plan</span>
+                                                {/* Expanded Focus Workspace (POLISHED) */}
+                                                {isFocused && (
+                                                    <div className="mt-3 pt-5 border-t border-[#E9DFD3]/80 animate-fade-in-up flex flex-col gap-6">
+                                                        
+                                                        {/* Top Workspace Meta */}
+                                                        <div className="flex flex-col gap-1.5 px-1">
+                                                            <span className="text-[10px] font-black uppercase tracking-widest text-purple-600">Currently Working</span>
+                                                            <h3 className="text-xl font-black text-gray-900 leading-tight">{task.title}</h3>
+                                                            <div className="flex flex-wrap items-center gap-2 mt-2">
+                                                                <span className="text-[11px] font-semibold text-gray-600 bg-gray-50 px-2.5 py-1 rounded border border-gray-100 shadow-3xs flex items-center gap-1.5"><span className="text-gray-400">⏱</span> {task.estimatedTime || "1 Hour"}</span>
+                                                                <span className="text-[11px] font-semibold text-gray-600 bg-gray-50 px-2.5 py-1 rounded border border-gray-100 shadow-3xs flex items-center gap-1.5"><span className="text-gray-400">📅</span> Due in {task.deadlineDays || 1}d</span>
+                                                            </div>
                                                         </div>
 
-                                                        {/* Subtask Progress Math */}
-                                                        {(() => {
-                                                            const completedSubs = task.subtasks.filter(s => s.completed).length;
-                                                            const totalSubs = task.subtasks.length;
-                                                            const subProgress = Math.round((completedSubs / totalSubs) * 100);
+                                                        {/* Smart Motivation */}
+                                                        <div className="bg-purple-50/50 p-4 rounded-xl border border-purple-100 flex items-start gap-3 animate-fade-in">
+                                                            <span className="text-lg leading-none mt-0.5">💡</span>
+                                                            <p className="text-sm font-semibold text-purple-800 italic leading-relaxed">"{getSmartMotivation(task.title)}"</p>
+                                                        </div>
 
-                                                            return (
-                                                                <div className="mb-3">
-                                                                    <div className="flex justify-between items-center text-[10px] font-bold text-purple-300 mb-1.5">
-                                                                        <span>{completedSubs}/{totalSubs} Completed</span>
-                                                                        <span>{subProgress}%</span>
-                                                                    </div>
-                                                                    <div className="w-full bg-purple-950/50 rounded-full h-1.5 overflow-hidden border border-purple-900/30">
-                                                                        <div className="bg-purple-500 h-1.5 rounded-full transition-all duration-300 shadow-[0_0_8px_rgba(168,85,247,0.8)]" style={{ width: `${subProgress}%` }}></div>
-                                                                    </div>
-                                                                </div>
-                                                            );
-                                                        })()}
+                                                        {/* Quick Notes Area */}
+                                                        <div className="flex flex-col gap-2">
+                                                            <div className="flex items-center justify-between px-1">
+                                                                <label className="text-[10px] font-black uppercase tracking-widest text-gray-400">Quick Notes</label>
+                                                                <span className={`text-[10px] font-black text-green-500 uppercase tracking-widest transition-opacity duration-300 flex items-center gap-1 ${notesSaved ? 'opacity-100' : 'opacity-0'}`}>
+                                                                    ✓ Saved
+                                                                </span>
+                                                            </div>
+                                                            <textarea 
+                                                                value={activeNoteContent}
+                                                                onChange={handleNotesChange}
+                                                                onBlur={handleNotesBlur}
+                                                                placeholder="Jot down thoughts, links, or progress here... Autosaves when you click away."
+                                                                className="w-full bg-[#FAF8F4] border border-[#E9DFD3] rounded-xl p-4 text-sm font-medium text-gray-800 placeholder-gray-400 focus:outline-none focus:border-purple-300 focus:ring-4 focus:ring-purple-500/10 transition-all resize-y min-h-[120px] shadow-inner"
+                                                            />
+                                                        </div>
 
-                                                        {/* Subtasks Checklists */}
-                                                        <ul className="space-y-2.5 pt-2">
-                                                            {task.subtasks.map((sub) => (
-                                                                <li 
-                                                                    key={sub.id} 
-                                                                    className="flex items-start gap-2.5 cursor-pointer group"
-                                                                    onClick={() => toggleSubtask(task.id, sub.id)}
-                                                                >
-                                                                    <div className={`w-4 h-4 rounded mt-0.5 border flex items-center justify-center shrink-0 transition-colors ${
-                                                                        sub.completed ? 'bg-purple-500 border-purple-500 text-white' : 'bg-[#09090B] border-purple-500/30 group-hover:border-purple-400'
-                                                                    }`}>
-                                                                        {sub.completed && <span className="text-[10px] font-bold">✓</span>}
-                                                                    </div>
-                                                                    <span className={`text-xs font-medium transition-all ${
-                                                                        sub.completed ? 'line-through text-zinc-500 italic' : 'text-zinc-200'
-                                                                    }`}>
-                                                                        {sub.title}
-                                                                    </span>
-                                                                </li>
-                                                            ))}
-                                                        </ul>
+                                                        {/* Bottom Bar: Complete Action */}
+                                                        <div className="flex justify-end pt-2">
+                                                            <button 
+                                                                onClick={() => handleCompleteWithAnimation(task.id)}
+                                                                className="px-8 py-3.5 bg-green-500 hover:bg-green-600 text-white rounded-xl font-bold text-sm shadow-[0_8px_24px_rgba(34,197,94,0.25)] transition-all active:scale-95 flex items-center gap-2 focus:outline-none focus-visible:ring-2 focus-visible:ring-offset-2 focus-visible:ring-green-500"
+                                                            >
+                                                                ✓ Mark as Complete
+                                                            </button>
+                                                        </div>
                                                     </div>
                                                 )}
-
-                                                {/* Action Buttons */}
-                                                <div className="flex gap-2 pt-2">
-                                                    {task.status !== "To Do" && (
-                                                        <button onClick={() => moveTask(task.id, "To Do")} className="flex-1 bg-[#18181B] hover:bg-zinc-800 text-zinc-400 text-[10px] font-bold py-1.5 rounded transition">
-                                                            To Do
-                                                        </button>
-                                                    )}
-                                                    {task.status !== "In Progress" && (
-                                                        <button onClick={() => moveTask(task.id, "In Progress")} className="flex-1 bg-purple-600/20 text-purple-400 hover:bg-purple-600/30 text-[10px] font-bold py-1.5 rounded transition">
-                                                            In Progress
-                                                        </button>
-                                                    )}
-                                                    {task.status !== "Completed" && (
-                                                        <button onClick={() => moveTask(task.id, "Completed")} className="flex-1 bg-green-500/20 text-green-400 hover:bg-green-500/30 border border-green-500/20 text-[10px] font-bold py-1.5 rounded transition">
-                                                            Complete
-                                                        </button>
-                                                    )}
-                                                </div>
-
                                             </div>
                                         );
                                     })}
-                            </div>
+                                </div>
+                            ) : (
+                                <div className="bg-white/60 border border-[#E9DFD3] border-dashed rounded-[24px] p-12 flex flex-col items-center justify-center text-center animate-fade-in-up">
+                                    <span className="text-5xl mb-4">{isOnlyRepeatingLeft ? "🌱" : "🎉"}</span>
+                                    <h3 className="text-xl font-black text-gray-900 mb-2">
+                                        {isOnlyRepeatingLeft ? "Great work." : "You're all caught up."}
+                                    </h3>
+                                    <p className="text-sm font-medium text-gray-500 max-w-sm">
+                                        {isOnlyRepeatingLeft ? "Keep your streak alive with these remaining habits." : "Enjoy the rest of your day."}
+                                    </p>
+                                </div>
+                            )}
                         </div>
-                    );
-                })}
+
+                        {/* RIGHT COLUMN: Milestones & Completed (25%) */}
+                        <div className="w-full lg:w-1/4 flex flex-col gap-6">
+                            
+                            {/* Upcoming Milestones */}
+                            <div className="bg-white rounded-[22px] border border-[#E9DFD3]/80 p-5 shadow-[0_8px_24px_rgba(80,62,38,0.04)]">
+                                <h3 className="text-sm font-black tracking-tight text-gray-950 mb-4">⏳ Upcoming</h3>
+                                {upcomingTasks.length > 0 ? (
+                                    <div className="relative pl-2.5 space-y-4">
+                                        <div className="absolute top-2 bottom-2 left-[13px] w-px bg-gray-100"></div>
+                                        {upcomingTasks.map((task, idx) => (
+                                            <div key={idx} className="relative flex items-center gap-3 z-10 hover:opacity-80 transition-opacity">
+                                                <div className="w-2 h-2 rounded-full ring-4 ring-white bg-gray-300 shrink-0"></div>
+                                                <div className="flex-1 min-w-0">
+                                                    <h4 className="text-xs font-bold text-gray-700 truncate">{task.title}</h4>
+                                                    <div className="flex items-center gap-2 mt-1">
+                                                        <span className={`text-[10px] font-black uppercase tracking-wider ${getDeadlineColor(task.deadlineDays)}`}>Due in {task.deadlineDays || 1}d</span>
+                                                    </div>
+                                                </div>
+                                            </div>
+                                        ))}
+                                    </div>
+                                ) : (
+                                    <p className="text-[11px] font-medium text-gray-400 italic">No upcoming tasks.</p>
+                                )}
+                            </div>
+
+                            {/* Completed Today */}
+                            <div className="bg-[#FAF8F4] rounded-[22px] border border-[#EFE5D9] p-2 shadow-sm">
+                                <button 
+                                    onClick={() => setCompletedExpanded(!completedExpanded)}
+                                    className="w-full flex items-center justify-between p-3 rounded-xl hover:bg-white transition-colors focus:outline-none focus-visible:ring-2 focus-visible:ring-purple-400"
+                                    aria-expanded={completedExpanded}
+                                >
+                                    <h3 className="text-sm font-black tracking-tight text-gray-900 flex items-center gap-2">
+                                        <span className="text-green-500 text-lg leading-none">✓</span> Completed Today
+                                    </h3>
+                                    <span className="text-gray-400 font-bold text-xs">{completedCount}</span>
+                                </button>
+                                
+                                {completedExpanded && (
+                                    <div className="px-3 pb-3 pt-1 space-y-2 animate-fade-in">
+                                        {completedTasksList.length > 0 ? completedTasksList.map((task, idx) => (
+                                            <div key={idx} className="flex items-center justify-between gap-3 p-2 rounded-lg bg-white border border-gray-100 shadow-3xs group transition-all">
+                                                <h4 className="text-[11px] font-bold text-gray-400 line-through truncate flex-1">{task.title}</h4>
+                                                <span className="text-[9px] font-black uppercase text-gray-300 tracking-wider shrink-0">Done</span>
+                                            </div>
+                                        )) : (
+                                            <p className="text-[11px] font-medium text-gray-400 px-2 py-1 italic">No tasks completed yet.</p>
+                                        )}
+                                    </div>
+                                )}
+                            </div>
+
+                        </div>
+                    </div>
+
+                </div>
             </div>
-        </div>
-        </MainLayout>
+        </>
     );
 }
 
